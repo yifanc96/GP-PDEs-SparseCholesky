@@ -135,8 +135,10 @@ The factor's upper-triangular sparsity after the maximin permutation
 ![U sparsity](docs/U_sparsity.png)
 
 Dense nnz would be `1600² = 2 560 000`. The sparse factor has ~217 000
-nonzeros (8.5 %), and that fraction **decreases** with N — the whole
-point of the algorithm.
+nonzeros (8.5 % of the dense triangle). The nnz count grows only
+linearly in N — roughly `O(N · ρᵈ)` total, `O(ρᵈ)` per column — so
+doubling N roughly halves the density fraction. That's the whole point
+of the algorithm.
 
 ---
 
@@ -245,20 +247,30 @@ Tuning knobs (environment variables):
   `spsolve_triangular` re-runs cuSPARSE analysis on every call and
   loses to SciPy in practice.
 
-## Reference timings (1× NVIDIA H200 GPU, steady state)
+## Reference timings (steady-state, after JAX JIT cache is warm)
 
-| example              | grid       | warm wall | L² error |
-| -------------------- | :--------- | --------: | -------: |
-| NonLinElliptic2d     | h = 0.02   |     1.5 s |   3.6e-5 |
-| NonLinElliptic2d     | h = 0.01   |     6.0 s |   2.1e-5 |
-| VarLinElliptic2d     | h = 0.05   |     0.3 s |   3.6e-2 |
-| Burgers1d, T = 0.1   | h = 0.01   |     0.3 s |   6.4e-3 |
-| MongeAmpere2d        | h = 0.1    |    0.11 s |   1.4e-2 |
+| example              | grid      | N      | CPU warm¹ | GPU warm² | L² error |
+| -------------------- | :-------- | -----: | --------: | --------: | -------: |
+| NonLinElliptic2d     | h = 0.02  |  2 600 |     3.6 s |     1.5 s |   ~2e-5  |
+| NonLinElliptic2d     | h = 0.01  | 10 200 |    16.6 s |     6.0 s |   ~1e-5  |
+| VarLinElliptic2d     | h = 0.05  |    520 |     1.0 s |     0.3 s |   3.7e-2 |
+| Burgers1d, T = 0.1   | h = 0.01  |    200 |    0.30 s |     0.3 s |   5e-3   |
+| MongeAmpere2d        | h = 0.1   |    120 |    0.47 s |    0.11 s |   1.5e-2 |
 
-Cold (first-call) times additionally include a one-time JAX JIT compile
-per supernode-size bucket. This is especially large (~60 s) for
-MongeAmpere because each pair evaluator fires several `jax.hessian` calls
-plus a Hessian-of-Hessian.
+¹ `backend='cpu'`, 32-thread pool with OpenBLAS pinned to 1 thread per
+worker (requires `pip install threadpoolctl`). Machine: dual-socket
+server, AMD EPYC class.
+² `backend='jax'` on a single NVIDIA H200 GPU. *Cold* (first-call) times
+are larger because JAX JIT-compiles the bucket kernel once per
+supernode-size bucket; the cost persists within a single Python
+process. MongeAmpere's cold time is especially large (~60 s) because
+each pair evaluator fires several `jax.hessian` calls plus a
+Hessian-of-Hessian. For the small 1-D Burgers example there's no GPU
+win — the per-call dispatch overhead matches CPU scipy.
+
+The GPU advantage grows with N (larger batched supernodes amortize
+dispatch / kernel-launch overhead): ~2.4× at N≈2 600, ~2.8× at
+N≈10 200 in the NonLinElliptic column above.
 
 ## License
 
