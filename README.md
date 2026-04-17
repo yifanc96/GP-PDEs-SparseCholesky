@@ -8,14 +8,14 @@ Two things in one repository:
 
 1. **`kolesky`** — fast sparse Cholesky of covariance (kernel) matrices
    on point clouds, following the Kullback–Leibler-minimization ordering
-   of Schäfer, Katzfuss, Owhadi (2020).
+   of Schäfer, Katzfuss, Owhadi (2020). 
 2. **`kolesky.pde`** — a GP + Gauss-Newton + preconditioned CG PDE solver
    that uses the factor as a preconditioner / implicit matvec, following
    Chen, Owhadi, Schäfer (2025).
 
 Both are Python ports of the original Julia code:
 
-* KoLesky.jl — [arXiv:2004.14455](https://arxiv.org/abs/2004.14455)
+* [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl) — [arXiv:2004.14455](https://arxiv.org/abs/2004.14455)
 * PDEs-GP-KoleskySolver — [arXiv:2304.01294](https://arxiv.org/abs/2304.01294)
 
 The original Julia source is preserved on the
