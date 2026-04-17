@@ -16,7 +16,7 @@ Two things in one repository:
 Both are Python ports of the original Julia code:
 
 * [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl) — [arXiv:2004.14455](https://arxiv.org/abs/2004.14455)
-* PDEs-GP-KoleskySolver — [arXiv:2304.01294](https://arxiv.org/abs/2304.01294)
+* [PDEs-GP-KoleskySolver](https://github.com/yifanc96/GP-PDEs-SparseCholesky/tree/initial-julia-code) — [arXiv:2304.01294](https://arxiv.org/abs/2304.01294)
 
 The original Julia source is preserved on the
 [`initial-julia-code`](../../tree/initial-julia-code) branch.
