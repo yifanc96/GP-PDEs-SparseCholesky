@@ -168,7 +168,7 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
     os.environ['JAX_PLATFORMS'] = args.platform
 
     import kolesky as kl
-    from kolesky.pde import NonlinElliptic2d, solve_nonlin_elliptic_2d
+    from kolesky.pde import NonlinElliptic, solve_nonlin_elliptic
 
     kernels = {
         'Matern5half': kl.MaternCovariance5_2,
@@ -184,12 +184,12 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
     # d-agnostic and never touches it. We pass a 2D bbox unconditionally.
     bx = (demo.X_domain[:, 0].min(), demo.X_domain[:, 0].max())
     by = (demo.X_domain[:, 1].min(), demo.X_domain[:, 1].max())
-    eqn = NonlinElliptic2d(
+    eqn = NonlinElliptic(
         alpha=demo.alpha, m=demo.m, domain=(bx, by),
         bdy=demo.u_exact, rhs=demo.rhs,
     )
     t0 = time.perf_counter()
-    sol = solve_nonlin_elliptic_2d(
+    sol = solve_nonlin_elliptic(
         eqn, kernel, demo.X_domain, demo.X_boundary,
         sol_init=np.zeros(demo.X_domain.shape[0]),
         nugget=args.nugget, GN_steps=args.GN_steps,

@@ -1,11 +1,12 @@
-"""Variable-coefficient nonlinear elliptic PDE solver.
+"""Variable-coefficient nonlinear elliptic PDE solver (any spatial d).
 
 -∇·(a(x) ∇u(x)) + α u(x)^m = f(x)  on Ω
 u = bdy  on ∂Ω
 
-Mirrors main_VarLinElliptic2d.jl. Measurements are Δ∇δ (Laplacian +
-gradient + Dirac); the big factor uses the DiracsFirstThenUnifScale
-ordering rather than FollowDiracs.
+The solver is dimension-agnostic: Δ∇δ measurements (Laplacian +
+gradient + Dirac) generalize naturally since the gradient weight is a
+`d`-vector. The big factor uses the DiracsFirstThenUnifScale ordering
+rather than FollowDiracs. Mirrors main_VarLinElliptic2d.jl.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from .pcg_ops import (
 
 
 @dataclass
-class VarLinElliptic2d:
+class VarLinElliptic:
     alpha: float
     m: int
     domain: Tuple[Tuple[float, float], Tuple[float, float]]
@@ -115,8 +116,8 @@ def _apply_grad(fn, X):
     return np.stack([np.asarray(fn(X[i]), dtype=np.float64) for i in range(X.shape[0])], axis=0)
 
 
-def solve_var_lin_elliptic_2d(
-    eqn: VarLinElliptic2d,
+def solve_var_lin_elliptic(
+    eqn: VarLinElliptic,
     kernel: AbstractCovarianceFunction,
     X_domain: np.ndarray,
     X_boundary: np.ndarray,

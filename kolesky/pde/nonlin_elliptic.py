@@ -1,6 +1,9 @@
 """Nonlinear elliptic PDE solver via iterative GPR + sparse Cholesky + pCG.
 
-Mirrors main_NonLinElliptic2d.jl's `iterGPR_fast_pcg`.
+Solves  -Δu + α u^m = f  with Dirichlet data in any spatial dimension.
+Mirrors the Julia `iterGPR_fast_pcg` routine from main_NonLinElliptic2d.jl
+but generalized: the Δδ measurement kernel takes `d` as a parameter and
+the maximin ordering / sparsity pattern are dimension-agnostic.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from .. import (
 )
 from ..measurements import LaplaceDiracPointMeasurement, PointMeasurement
 
-from .pdes import NonlinElliptic2d
+from .pdes import NonlinElliptic, NonlinElliptic2d  # NonlinElliptic2d is alias
 from .pcg_ops import BigFactorOperator, SmallPrecond, ThetaTrainMatVec, predict_via_big
 
 
@@ -77,8 +80,8 @@ def _apply_vector_rhs(eqn, X):
     return np.array([eqn(X[i]) for i in range(X.shape[0])], dtype=np.float64)
 
 
-def solve_nonlin_elliptic_2d(
-    eqn: NonlinElliptic2d,
+def solve_nonlin_elliptic(
+    eqn: NonlinElliptic,
     kernel: AbstractCovarianceFunction,
     X_domain: np.ndarray,
     X_boundary: np.ndarray,
@@ -106,11 +109,12 @@ def solve_nonlin_elliptic_2d(
     N_dom = X_domain.shape[0]
     N_bdy = X_boundary.shape[0]
     d = X_domain.shape[1]
-    # Dimension-agnostic: the Δδ kernel takes d as a parameter, and maximin
-    # ordering + sparsity pattern use Euclidean distance in any dimension.
-    # `solve_nonlin_elliptic` is exported as the d-general alias.
+    # Dimension-agnostic: the Δδ kernel takes d as a parameter, and the
+    # maximin ordering / sparsity pattern use Euclidean distance in any
+    # dimension. We sanity-check 1 ≤ d ≤ 3; higher dims should in principle
+    # also work but have never been tested here.
     if d not in (1, 2, 3):
-        raise ValueError(f'unsupported dimension d={d} (supported: 1, 2, 3)')
+        raise ValueError(f'untested dimension d={d} (tested: 1, 2, 3)')
 
     rhs_values = _apply_vector_rhs(eqn.rhs, X_domain)
     bdy_values = _apply_vector_rhs(eqn.bdy, X_boundary)
@@ -214,7 +218,7 @@ def solve_nonlin_elliptic_2d(
 
 
 def iterGPR_exact(
-    eqn: NonlinElliptic2d,
+    eqn: NonlinElliptic,
     kernel: AbstractCovarianceFunction,
     X_domain: np.ndarray,
     X_boundary: np.ndarray,
