@@ -65,6 +65,65 @@ def _frame(ax, outline: Sequence[np.ndarray], pad: float = 0.05):
     ax.set_xlabel('x'); ax.set_ylabel('y')
 
 
+def plot_three_panel_3d(demo: 'GeometryDemo', sol: np.ndarray, out: pathlib.Path):
+    """3D scatter version: three panels (points, solution, error) on
+    matplotlib Axes3D. Outlines are lists of (M, 3) polylines.
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d)
+    X = demo.X_domain
+    Xb = demo.X_boundary
+    truth = np.array([demo.u_exact(X[i]) for i in range(X.shape[0])])
+    err = np.abs(truth - sol)
+
+    fig = plt.figure(figsize=(16, 5.5), constrained_layout=True)
+    ax_kw = dict(projection='3d')
+    axes = [fig.add_subplot(1, 3, i + 1, **ax_kw) for i in range(3)]
+
+    all_pts = np.vstack([X, Xb])
+    lo_xyz = all_pts.min(axis=0) - 0.03
+    hi_xyz = all_pts.max(axis=0) + 0.03
+
+    def _frame(ax):
+        ax.set_xlim(lo_xyz[0], hi_xyz[0])
+        ax.set_ylim(lo_xyz[1], hi_xyz[1])
+        ax.set_zlim(lo_xyz[2], hi_xyz[2])
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+        ax.view_init(elev=22, azim=40)
+        # draw outlines
+        for pl in demo.outline:
+            ax.plot(pl[:, 0], pl[:, 1], pl[:, 2], 'k-', lw=0.9, alpha=0.45)
+
+    # thin marker for 3D clarity
+    axes[0].scatter(X[:, 0], X[:, 1], X[:, 2], s=3, c='tab:blue', alpha=0.35,
+                    label=f'interior ({X.shape[0]})')
+    axes[0].scatter(Xb[:, 0], Xb[:, 1], Xb[:, 2], s=3, c='tab:red', alpha=0.7,
+                    label=f'boundary ({Xb.shape[0]})')
+    _frame(axes[0])
+    axes[0].set_title('sample points', fontsize=12)
+    axes[0].legend(loc='upper left', fontsize=9)
+
+    lo, hi = truth.min(), truth.max()
+    sc1 = axes[1].scatter(X[:, 0], X[:, 1], X[:, 2], c=sol, cmap='viridis',
+                          s=4, alpha=0.55, vmin=lo, vmax=hi)
+    _frame(axes[1])
+    axes[1].set_title('numerical solution $u_h$', fontsize=12)
+    fig.colorbar(sc1, ax=axes[1], shrink=0.7)
+
+    sc2 = axes[2].scatter(X[:, 0], X[:, 1], X[:, 2], c=err, cmap='inferno',
+                          s=4, alpha=0.55)
+    _frame(axes[2])
+    L2 = float(np.sqrt(np.mean(err ** 2)))
+    Linf = float(err.max())
+    axes[2].set_title(f'|$u_h$ − $u$|   L²={L2:.1e}, L∞={Linf:.1e}', fontsize=12)
+    fig.colorbar(sc2, ax=axes[2], shrink=0.7)
+
+    fig.suptitle(demo.name, fontsize=14, y=1.02)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    return L2, Linf
+
+
 def plot_three_panel(demo: GeometryDemo, sol: np.ndarray, out: pathlib.Path):
     truth = np.array([demo.u_exact(demo.X_domain[i]) for i in range(demo.X_domain.shape[0])])
     err = np.abs(truth - sol)
@@ -121,10 +180,12 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
     print(f'[kernel]  {args.kernel}, length_scale = {args.sigma}')
     print(f'[points]  interior = {demo.X_domain.shape[0]}, boundary = {demo.X_boundary.shape[0]}')
 
+    # `domain` is only used by the 2D grid sampler; the solver itself is
+    # d-agnostic and never touches it. We pass a 2D bbox unconditionally.
+    bx = (demo.X_domain[:, 0].min(), demo.X_domain[:, 0].max())
+    by = (demo.X_domain[:, 1].min(), demo.X_domain[:, 1].max())
     eqn = NonlinElliptic2d(
-        alpha=demo.alpha, m=demo.m,
-        domain=((demo.X_domain[:, 0].min(), demo.X_domain[:, 0].max()),
-                (demo.X_domain[:, 1].min(), demo.X_domain[:, 1].max())),
+        alpha=demo.alpha, m=demo.m, domain=(bx, by),
         bdy=demo.u_exact, rhs=demo.rhs,
     )
     t0 = time.perf_counter()
@@ -139,7 +200,10 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
     print(f'[solve]   {t1 - t0:.3f} s')
 
     out = pathlib.Path(args.out) if args.out else pathlib.Path(f'docs/{demo.name}.png')
-    L2, Linf = plot_three_panel(demo, sol, out)
+    if demo.X_domain.shape[1] == 3:
+        L2, Linf = plot_three_panel_3d(demo, sol, out)
+    else:
+        L2, Linf = plot_three_panel(demo, sol, out)
     print(f'[error]   L² = {L2:.3e}, L∞ = {Linf:.3e}')
     print(f'[figure]  {out}')
     return {'wall': t1 - t0, 'L2': L2, 'Linf': Linf}

@@ -106,8 +106,11 @@ def solve_nonlin_elliptic_2d(
     N_dom = X_domain.shape[0]
     N_bdy = X_boundary.shape[0]
     d = X_domain.shape[1]
-    if d != 2:
-        raise ValueError('solve_nonlin_elliptic_2d assumes d=2')
+    # Dimension-agnostic: the Δδ kernel takes d as a parameter, and maximin
+    # ordering + sparsity pattern use Euclidean distance in any dimension.
+    # `solve_nonlin_elliptic` is exported as the d-general alias.
+    if d not in (1, 2, 3):
+        raise ValueError(f'unsupported dimension d={d} (supported: 1, 2, 3)')
 
     rhs_values = _apply_vector_rhs(eqn.rhs, X_domain)
     bdy_values = _apply_vector_rhs(eqn.bdy, X_boundary)

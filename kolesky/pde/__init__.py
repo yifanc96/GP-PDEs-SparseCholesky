@@ -22,6 +22,9 @@ else 'cpu').
 from .pdes import NonlinElliptic2d
 from .sampling import sample_points_grid_2d, sample_points_rdm_2d
 from .nonlin_elliptic import solve_nonlin_elliptic_2d, iterGPR_exact
+# `solve_nonlin_elliptic` is the d-agnostic alias (the "_2d" name is kept
+# for backwards compatibility with the early release).
+solve_nonlin_elliptic = solve_nonlin_elliptic_2d
 from .varlin_elliptic import VarLinElliptic2d, solve_var_lin_elliptic_2d
 from .burgers import Burgers1d, solve_burgers_1d, sample_points_grid_1d
 from .monge_ampere import MongeAmpere2d, solve_monge_ampere_2d
@@ -39,6 +42,7 @@ __all__ = [
     "MongeAmpere2d",
     # solvers
     "solve_nonlin_elliptic_2d",
+    "solve_nonlin_elliptic",
     "solve_var_lin_elliptic_2d",
     "solve_burgers_1d",
     "solve_monge_ampere_2d",

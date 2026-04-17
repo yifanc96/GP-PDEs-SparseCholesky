@@ -353,6 +353,48 @@ geometry (`in_domain`, `sample_interior`, boundary samplers) — the
 actual PDE call is a single `solve_nonlin_elliptic_2d(...)`. Swap the
 sampler for your own domain and you're done.
 
+#### 3D geometry gallery
+
+The nonlinear elliptic solver is **dimension-agnostic** — the Δδ kernel
+and maximin ordering both work in any `d`. A d-general alias
+`solve_nonlin_elliptic` is exported alongside the `_2d` name, and
+below are seven 3D demos run on the *same* function:
+
+| script                                   | geometry                                  | L²       |
+| ---------------------------------------- | :---------------------------------------- | -------: |
+| `torus_nonlin_elliptic.py`               | solid torus (multiply-connected)          | 1.0e-4*  |
+| `swiss_cheese_cube_nonlin_elliptic.py`   | cube with 6 spherical holes               | 2.3e-4   |
+| `bowl_nonlin_elliptic.py`                | ball minus an off-centre ball (bowl)      | 1.2e-4   |
+| `schwarzp_nonlin_elliptic.py`            | Schwarz-P triply-periodic (cube-bound)    | 1.0e-3   |
+| `helix_nonlin_elliptic.py`               | thick helical tube                        | 2.6e-4   |
+| `bunny_nonlin_elliptic.py`               | Stanford bunny (OBJ mesh, 2503 verts)     | 5.6e-4   |
+| `bracket_nonlin_elliptic.py`             | L-bracket built by CSG with bolt-holes    | 4.6e-6   |
+
+\*at 10k interior points; the rest at 5k. Same Matern 7/2 kernel, ρ=3,
+3 Gauss-Newton steps. Note that reaching 2D-level accuracy in 3D needs
+roughly `N^{3/2}` points (~10⁵ instead of ~3 × 10³) — 5k is sufficient
+to clearly show the method working; it's not the asymptotic regime.
+
+Sampler patterns used:
+* **Implicit inequality** — torus, bowl, Schwarz-P, metaball blobs.
+* **Numerical projection onto f(x)=0** — Schwarz-P, blob surface.
+* **Distance-to-curve (scipy.cKDTree)** — helical tube.
+* **Mesh `contains` + surface sample** — Stanford bunny (via `trimesh`).
+* **CSG boolean** (`trimesh.boolean.union/difference` backed by
+  manifold3d) — L-bracket built from a box union with bolt-hole
+  cylinders subtracted. No STEP reader required.
+
+|     |     |
+| --- | --- |
+| ![torus](docs/torus.png) | ![swiss cheese cube](docs/swiss_cheese_cube.png) |
+| ![bowl](docs/bowl.png) | ![Schwarz-P](docs/schwarzp.png) |
+| ![helix](docs/helix.png) | ![bunny](docs/bunny.png) |
+| ![bracket](docs/bracket.png) | |
+
+Optional dependencies for 3D examples:
+* `trimesh` + `rtree` for the Stanford bunny mesh (`pip install trimesh rtree`).
+* `manifold3d` for the L-bracket CSG (`pip install manifold3d`).
+
 ### Other PDEs
 
 ```python
