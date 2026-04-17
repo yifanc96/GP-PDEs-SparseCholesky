@@ -395,6 +395,34 @@ Optional dependencies for 3D examples:
 * `trimesh` + `rtree` for the Stanford bunny mesh (`pip install trimesh rtree`).
 * `manifold3d` for the L-bracket CSG (`pip install manifold3d`).
 
+### Time-dependent demo: scalar transport past a cylinder
+
+Time stepping on an irregular domain drops out of the same machinery.
+`examples/flow_past_cylinder.py` solves 2-D scalar advection-diffusion
+with an analytical potential-flow velocity past a circular obstacle,
+
+    c_t + u·∇c − D Δc = 0                  on Ω = [0,6] × [-1.5,1.5] \ disk
+    c(y, t) = oscillating Gaussian pulse   at the inlet
+
+discretized with **fully implicit backward-Euler** — each step solves
+`(1 + dt·u·∇ − dt·D·Δ) cⁿ⁺¹ = cⁿ` as a single linear GP regression with
+one Δ∇δ measurement per interior point and a δ measurement per boundary
+point. Because the operator is time-independent, the sparse Cholesky
+factors are **built once and reused across all 160 time steps** — per
+step cost is one pCG solve.
+
+```bash
+python examples/flow_past_cylinder.py --N-interior 5000
+```
+
+![flow past cylinder](docs/flow_past_cylinder.gif)
+
+5000 interior + 480 boundary points, Matern 7/2 at σ = 0.12, D = 0.01,
+dt = 0.05, T = 8. This is mathematically the vorticity-transport step of
+a streamfunction/vorticity Navier-Stokes solver; closing the loop with a
+Poisson solve `−Δψ = ω` (a call to `solve_nonlin_elliptic` with α=0) and
+`u = (∂ψ/∂y, −∂ψ/∂x)` gives full 2-D NS on the same scaffolding.
+
 ### Other PDEs
 
 ```python
