@@ -106,20 +106,17 @@ def potential_flow(box: Box, X: np.ndarray, U_inf: float = 1.0) -> np.ndarray:
     return np.stack([u, v], axis=1)
 
 
-def inlet_pulse(y, t, sigma=0.25, amp_y=0.7, freq=0.6):
-    """Plume whose centre y-coordinate oscillates sinusoidally in time
-    (∈ [−amp_y, amp_y]) and whose amplitude pulses on/off. Produces a
-    visibly moving / wrapping plume in the animation.
-    """
-    y0 = amp_y * np.sin(2 * np.pi * freq * t)
-    envelope = 0.5 * (1.0 + np.cos(2 * np.pi * freq * t * 0.5))  # slow pulse
-    return envelope * np.exp(-0.5 * ((y - y0) / sigma) ** 2)
-
-
 def bc_values(X_bdy, tag, t):
-    vals = np.zeros(X_bdy.shape[0])
-    vals[tag == 0] = inlet_pulse(X_bdy[tag == 0, 1], t)
-    return vals
+    """Zero Dirichlet everywhere: the initial blob carries the signal."""
+    return np.zeros(X_bdy.shape[0])
+
+
+def initial_blob(X: np.ndarray, centre=(0.6, 0.35), width=0.22) -> np.ndarray:
+    """Gaussian tracer released upstream of the cylinder. The potential
+    flow then advects (and diffuses) it past the obstacle."""
+    dx = X[:, 0] - centre[0]
+    dy = X[:, 1] - centre[1]
+    return np.exp(-0.5 * (dx * dx + dy * dy) / (width * width))
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +230,29 @@ def parse_args(argv=None):
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', default='docs/flow_past_cylinder.gif')
     p.add_argument('--frame-every', type=int, default=2)
+    p.add_argument('--render-only', action='store_true',
+                   help='skip simulation; load cached .npz next to --out and re-render')
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
     os.environ['JAX_PLATFORMS'] = args.platform
+
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    npz_path = out_path.with_suffix('.npz')
+
+    if args.render_only:
+        print(f'[render-only] loading {npz_path}')
+        d = np.load(npz_path)
+        box = Box(Lx=float(d['box_Lx']), Ly=float(d['box_Ly']),
+                  x_cyl=float(d['box_x_cyl']), y_cyl=float(d['box_y_cyl']),
+                  r_cyl=float(d['box_r_cyl']))
+        _render_animation(out_path, d['X_dom'], d['X_bdy'], d['tag'],
+                          d['times'], d['c_frames'], box, float(d['U_inf']))
+        print(f'[done] {out_path}')
+        return
 
     box = Box()
     rng = np.random.default_rng(args.seed)
@@ -257,11 +271,11 @@ def main(argv=None):
         k_neighbors=args.k_neighbors,
     )
 
-    c_dom = np.zeros(X_dom.shape[0])
+    c_dom = initial_blob(X_dom)
     n_steps = int(round(args.T / args.dt))
     print(f'[simulate] n_steps = {n_steps}, dt = {args.dt}')
 
-    frames = []
+    frames = [(0.0, c_dom.copy())]
     t_loop = time.perf_counter()
     for step in range(n_steps):
         t = (step + 1) * args.dt
@@ -277,36 +291,107 @@ def main(argv=None):
     print(f'[simulate] total loop wall: {time.perf_counter()-t_loop:.2f} s')
 
     print(f'[render] {len(frames)} frames …')
-    fig, ax = plt.subplots(figsize=(12, 5.5), constrained_layout=True)
-    sc = ax.scatter(X_dom[:, 0], X_dom[:, 1], c=frames[0][1],
-                    s=10, cmap='viridis', vmin=0.0, vmax=1.0)
-    cyl = mpatches.Circle((box.x_cyl, box.y_cyl), box.r_cyl,
-                          fc='white', ec='black', lw=1.5, zorder=5)
-    ax.add_patch(cyl)
-    box_outline = np.array([[0, -box.Ly/2], [box.Lx, -box.Ly/2],
-                            [box.Lx, box.Ly/2], [0, box.Ly/2],
-                            [0, -box.Ly/2]])
-    ax.plot(box_outline[:, 0], box_outline[:, 1], 'k-', lw=1.5)
-    ax.set_aspect('equal'); ax.set_xlim(-0.1, box.Lx + 0.1)
-    ax.set_ylim(-box.Ly / 2 - 0.1, box.Ly / 2 + 0.1)
-    ax.set_xlabel('x'); ax.set_ylabel('y')
-    fig.colorbar(sc, ax=ax, shrink=0.85, label='concentration')
-    ttl = ax.set_title('')
+    times = np.array([t for t, _ in frames])
+    c_frames = np.stack([c for _, c in frames], axis=0)  # (F, N_dom)
 
+    np.savez_compressed(
+        npz_path, X_dom=X_dom, X_bdy=X_bdy, tag=tag,
+        times=times, c_frames=c_frames,
+        box_Lx=box.Lx, box_Ly=box.Ly,
+        box_x_cyl=box.x_cyl, box_y_cyl=box.y_cyl, box_r_cyl=box.r_cyl,
+        U_inf=args.U_inf,
+    )
+    print(f'[render] cached frame data at {npz_path}')
+
+    _render_animation(out_path, X_dom, X_bdy, tag, times, c_frames, box, args.U_inf)
+    print(f'[done] {out_path}')
+
+
+def _render_animation(out_path, X_dom, X_bdy, tag, times, c_frames, box, U_inf):
+    """Smooth tricontourf field + static streamlines of the potential flow."""
+    from matplotlib.tri import Triangulation
     from matplotlib.animation import FuncAnimation, PillowWriter
 
-    def update(i):
-        t_i, c_i = frames[i]
-        sc.set_array(c_i)
-        ttl.set_text(f'flow past cylinder — t = {t_i:.2f},  N_int = {X_dom.shape[0]}')
-        return sc, ttl
+    # Triangulate interior + boundary so the field reaches every edge.
+    X_all = np.vstack([X_dom, X_bdy])
+    triang = Triangulation(X_all[:, 0], X_all[:, 1])
 
-    ani = FuncAnimation(fig, update, frames=len(frames), interval=60, blit=False)
-    out_path = pathlib.Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tris = triang.triangles
+    centroids = X_all[tris].mean(axis=1)
+    inside_cyl = ((centroids[:, 0] - box.x_cyl) ** 2
+                  + (centroids[:, 1] - box.y_cyl) ** 2
+                  < (box.r_cyl + 0.015) ** 2)
+    edge_lens = np.stack([
+        np.linalg.norm(X_all[tris[:, 0]] - X_all[tris[:, 1]], axis=1),
+        np.linalg.norm(X_all[tris[:, 1]] - X_all[tris[:, 2]], axis=1),
+        np.linalg.norm(X_all[tris[:, 2]] - X_all[tris[:, 0]], axis=1),
+    ], axis=0)
+    too_long = edge_lens.max(axis=0) > 5 * np.median(edge_lens.max(axis=0))
+    triang.set_mask(inside_cyl | too_long)
+
+    # Stationary potential-flow streamlines (computed once).
+    gx = np.linspace(0.02, box.Lx - 0.02, 100)
+    gy = np.linspace(-box.Ly / 2 + 0.02, box.Ly / 2 - 0.02, 50)
+    GX, GY = np.meshgrid(gx, gy)
+    grid_pts = np.stack([GX.ravel(), GY.ravel()], axis=1)
+    u_grid = potential_flow(box, grid_pts, U_inf=U_inf)
+    inside_grid = ((grid_pts[:, 0] - box.x_cyl) ** 2
+                   + (grid_pts[:, 1] - box.y_cyl) ** 2 < box.r_cyl ** 2)
+    u_grid[inside_grid] = np.nan
+    U = u_grid[:, 0].reshape(GY.shape)
+    V = u_grid[:, 1].reshape(GY.shape)
+
+    # Truncate frames after the plume decays below a useful amplitude
+    # (so we don't render noise). Then per-frame auto-vmax so the plume
+    # stays visible as its absolute amplitude shrinks.
+    frame_peak = np.percentile(c_frames, 99.5, axis=1)
+    keep = frame_peak >= 0.03
+    if keep.sum() < len(keep):
+        last = int(np.argmin(keep[: np.argmax(~keep) + 1]))  # noqa
+        # Simpler: truncate at the last index where peak >= threshold.
+        last_idx = int(np.where(keep)[0].max())
+        times = times[: last_idx + 1]
+        c_frames = c_frames[: last_idx + 1]
+        frame_peak = frame_peak[: last_idx + 1]
+    per_frame_vmax = np.maximum(frame_peak, 0.03)
+    vmax_display = 1.0
+    print(f'[render] keeping {len(times)} frames (peak c ≥ 0.03), '
+          f'per-frame vmax range: '
+          f'{per_frame_vmax.min():.3f} → {per_frame_vmax.max():.3f}')
+
+    fig, ax = plt.subplots(figsize=(12, 5.5), constrained_layout=True)
+    # Include boundary values in the field for correct edge rendering.
+    c_all0 = np.concatenate([c_frames[0], bc_values(X_bdy, tag, times[0])]) / per_frame_vmax[0]
+    tpc = ax.tripcolor(triang, c_all0, shading='gouraud',
+                       cmap='magma', vmin=0, vmax=vmax_display)
+    ax.streamplot(GX, GY, U, V, color='white', linewidth=0.4,
+                  density=0.9, arrowsize=0.7, arrowstyle='-')
+    cyl = mpatches.Circle((box.x_cyl, box.y_cyl), box.r_cyl,
+                          fc='#222', ec='white', lw=1.2, zorder=5)
+    ax.add_patch(cyl)
+    box_outline = np.array([[0, -box.Ly / 2], [box.Lx, -box.Ly / 2],
+                            [box.Lx, box.Ly / 2], [0, box.Ly / 2],
+                            [0, -box.Ly / 2]])
+    ax.plot(box_outline[:, 0], box_outline[:, 1], 'k-', lw=1.2)
+    ax.set_aspect('equal')
+    ax.set_xlim(-0.05, box.Lx + 0.05)
+    ax.set_ylim(-box.Ly / 2 - 0.05, box.Ly / 2 + 0.05)
+    ax.set_xlabel('x'); ax.set_ylabel('y')
+    fig.colorbar(tpc, ax=ax, shrink=0.85, label='concentration (normalized)')
+    ttl = ax.set_title('')
+
+    def update(i):
+        c_all_i = np.concatenate([c_frames[i], bc_values(X_bdy, tag, times[i])]) / per_frame_vmax[i]
+        tpc.set_array(c_all_i)
+        ttl.set_text(
+            f'flow past cylinder — t = {times[i]:.2f},  '
+            f'peak c ≈ {per_frame_vmax[i]:.3f}'
+        )
+        return [tpc, ttl]
+
+    ani = FuncAnimation(fig, update, frames=len(times), interval=60, blit=False)
     ani.save(out_path, writer=PillowWriter(fps=18))
     plt.close(fig)
-    print(f'[done] {out_path}')
 
 
 if __name__ == '__main__':
