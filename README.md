@@ -12,7 +12,7 @@ Two pieces, same repo:
 
 1. **`kolesky`** — sparse approximate Cholesky of kernel matrices on
    point clouds in any dimension, using the Kullback–Leibler
-   minimization ordering of
+   minimization and maximin ordering in
    [Schäfer, Katzfuss, Owhadi 2020](https://arxiv.org/abs/2004.14455).
 2. **`kolesky.pde`** — a GP-regression PDE solver that uses the factor
    as a fast matvec *and* a preconditioner, following
