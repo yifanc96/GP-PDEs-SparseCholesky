@@ -6,7 +6,7 @@ Meshless PDE solver on arbitrary point clouds, backed by an approximate
 sparse Cholesky factorization of the kernel matrix that runs in
 `O(N · ρᵈ)` time and memory. Handles 2D and 3D domains with complicated
 geometry (curved boundaries, holes, cracks, CAD-style shapes); optional
-JAX/CUDA acceleration.
+JAX/CUDA acceleration. 
 
 Two pieces, same repo:
 
@@ -20,7 +20,7 @@ Two pieces, same repo:
 
 Both are Python ports of the original Julia code:
 
-* [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl) — [arXiv:2004.14455](https://arxiv.org/abs/2004.14455)
+* [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl) — [arXiv:2004.14455](https://arxiv.org/abs/2004.14455) Thanks Claude Code's help to make it Pythonic.
 * [PDEs-GP-KoleskySolver](https://github.com/yifanc96/GP-PDEs-SparseCholesky/tree/initial-julia-code) — [arXiv:2304.01294](https://arxiv.org/abs/2304.01294)
 
 The original Julia source is preserved on the
