@@ -140,6 +140,55 @@ PDE examples below. The nnz count grows only linearly in N — roughly
 `O(N · ρᵈ)` total, `O(ρᵈ)` per column — so doubling N roughly halves
 the density fraction. That's the whole point of the algorithm.
 
+### Beyond point values: derivative measurements
+
+Everything above works for **any** linear functional of the GP, not just
+point evaluations `u(xᵢ)`. For PDE applications you usually need to
+impose things like `Δu(xᵢ)` or `∂₁₁u(xᵢ)` — the same sparse-factor
+machinery handles them transparently, because a linear functional `L`
+of a GP is itself a GP and the covariance kernel `K(Lₓ, Lᵧ)` is obtained
+by applying `L` twice to the original kernel.
+
+| class                              | measurement                                               | used by                                   |
+| ---------------------------------- | --------------------------------------------------------- | ----------------------------------------- |
+| `PointMeasurement`                 | `u(x)`                                                    | any GP regression with point data         |
+| `LaplaceDiracPointMeasurement`     | `w_Δ Δu(x) + w_δ u(x)`                                    | `NonLinElliptic2d`                        |
+| `LaplaceGradDiracPointMeasurement` | `w_Δ Δu + ⟨w_∇, ∇u⟩ + w_δ u`, all at `x`                  | `VarLinElliptic2d`, `Burgers1d`           |
+| `HessianDiracPointMeasurement`     | `w₁₁ ∂₁₁u + w₁₂ ∂₁₂u + w₂₂ ∂₂₂u + w_δ u`  (d=2)           | `MongeAmpere2d`                           |
+
+These are *exactly* the linearizations you get by writing each PDE's
+differential operator as a weighted sum of local measurements:
+
+* `-Δu + α u^m = f`: after linearizing around `v`, the operator at `xᵢ`
+  becomes `-Δu(xᵢ) + α·m·v^{m-1}(xᵢ) · u(xᵢ)` — a `Δδ` measurement.
+* `-∇·(a∇u) + α u^m = f`: same idea but with a `Δ∇δ` measurement that
+  picks up the `∇a(xᵢ)` gradient-contraction term.
+* `u_t + u u_x - ν u_xx = 0` (Crank-Nicolson): a `Δ∇δ` measurement in
+  1D.
+* `det(∇²u) = f`: after linearization, `v_yy ∂₁₁u − 2 v_xy ∂₁₂u +
+  v_xx ∂₂₂u` at each interior point — a `∂∂` measurement with `w_δ=0`.
+
+Kernel evaluations, ordering, factorization, and solve all work
+unchanged; you just feed the right measurement container in. Example —
+one Dirichlet boundary + one Laplacian point, with the Matérn 5/2
+kernel:
+
+```python
+import numpy as np, kolesky as kl
+from kolesky import LaplaceDiracPointMeasurement
+
+bdy_pt   = LaplaceDiracPointMeasurement(
+    coordinate=np.array([[0.0, 0.0]]),
+    weight_laplace=np.array([0.0]), weight_delta=np.array([1.0]),
+)  #  u(0, 0)
+interior = LaplaceDiracPointMeasurement(
+    coordinate=np.array([[0.5, 0.5]]),
+    weight_laplace=np.array([-1.0]), weight_delta=np.array([0.0]),
+)  # -Δu(0.5, 0.5)
+all_meas = kl.stack_measurements([bdy_pt, interior])
+print(kl.MaternCovariance5_2(0.2)(all_meas))     # 2x2 covariance
+```
+
 ---
 
 ## Part 2. Using `kolesky.pde` to solve PDEs
@@ -157,6 +206,46 @@ two roles in the pipeline:
 All you have to supply is the PDE data (domain, right-hand side,
 boundary data, and an initial iterate). Choose `backend='auto'` and the
 heavy factorization work runs on GPU when available.
+
+### How the measurements are ordered
+
+For a single point cloud, reverse-maximin is unambiguous: pick the point
+farthest from those already picked, repeat. For PDE problems you
+typically have **several measurement groups at the same locations** —
+e.g. both `u(xᵢ)` and `Δu(xᵢ)` at every interior point — so running
+plain maximin on the concatenated list is ill-defined (distance zero
+between a δ and its co-located Δδ). `kolesky` provides two canonical
+multi-set orderings that `kolesky.pde` invokes for you:
+
+* **FollowDiracs** (`ImplicitKLFactorization.build_follow_diracs`).
+  Run maximin on `(boundary, interior_δ)`. Then, for each interior
+  point, insert its derivative measurements **immediately after** its
+  δ in the ordering. Effect: matching `δ / Δu` (or `δ / ∂∂u`) pairs
+  end up in the same supernode, so the factor captures their strong
+  co-dependence. Used by `NonLinElliptic2d` and `Burgers1d`.
+
+* **DiracsFirstThenUnifScale** (`…build_diracs_first_then_unif_scale`).
+  Same maximin-on-first-two-sets step, then concatenate each
+  derivative block **at the end**, all at the finest length scale.
+  Better when the spatial operator dominates (strongly oscillating
+  coefficients, hard determinant nonlinearities). Used by
+  `VarLinElliptic2d` and `MongeAmpere2d`.
+
+Which variant each PDE uses is baked in; the choice reflects what
+actually works best for each equation in the paper. The table below
+summarizes:
+
+| PDE              | ordering variant                | measurement sets in the "big" factor              |
+| ---------------- | :------------------------------ | :------------------------------------------------ |
+| NonLinElliptic2d | FollowDiracs (3 sets)           | boundary δ, interior δ, −Δ on interior            |
+| VarLinElliptic2d | DiracsFirstThenUnifScale (3)    | boundary δ, interior δ, `−a∆ − ∇a·∇` on interior  |
+| Burgers1d        | FollowDiracs (4 sets)           | boundary δ, interior δ, `∇_int`, `Δ_int`          |
+| MongeAmpere2d    | DiracsFirstThenUnifScale (5)    | boundary δ, interior δ, `∂₁₁`, `∂₂₂`, `∂₁₂`        |
+
+At each Gauss-Newton step, `kolesky.pde` reuses this "big" factor and
+only rebuilds a small 2-set factor for `(boundary δ, linearized-PDE
+measurement)` — at ρ_small and with the same ordering skeleton — to
+serve as a preconditioner.
 
 ### Solving  `-Δu + α uᵐ = f`  on  `[0,1]²`
 
