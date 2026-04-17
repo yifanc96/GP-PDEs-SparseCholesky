@@ -281,27 +281,43 @@ Ground truth vs numerical solution on a 50×50 grid — Matern 7/2 kernel,
 ### Complicated geometries — the mesh-free advantage
 
 The solver takes raw point arrays, not meshes. To change the geometry
-you just change how you sample `X_domain` and `X_boundary` — everything
-downstream (maximin ordering, sparse factorization, Gauss-Newton, pCG)
-runs unchanged. A **single-file L-shape demo** is included:
+you just change how you sample `X_domain` and `X_boundary` — every
+step downstream (maximin ordering, sparse factorization, Gauss-Newton,
+pCG) runs unchanged. Two runnable demos are included.
+
+**L-shape — re-entrant corner.** Classic domain `Ω = [0, 1]² \ [0.5, 1]²`.
+Interior is rejection-sampled uniformly; boundary points are parametric
+along the six edges.
 
 ```bash
 python examples/lshape_nonlin_elliptic.py --N-interior 3000 --backend cpu
 ```
 
-Same PDE as above (`-Δu + u³ = f` with manufactured solution
-`u = sin πx · sin πy`), but posed on the classic re-entrant
-`Ω = [0, 1]² \ [0.5, 1]²`. The interior is rejection-sampled uniformly;
-boundary points are parametric along the six edges.
-
 ![L-shape demo](docs/lshape.png)
 
-The whole solve takes **~9 s on CPU** (3000 interior + 320 boundary
-points, Matern 7/2, ρ = 3, 3 Gauss-Newton steps) and reaches **L² ≈
-4·10⁻⁶, L∞ ≈ 6·10⁻⁵**. No mesh, no element assembly, no need to
-re-derive anything — the machinery for rectangular domains is the
-machinery for L-shapes, disks, polygons with holes, or point clouds
-straight out of a CAD tool.
+~9 s on CPU with 3000 + 320 points (Matern 7/2, ρ=3, 3 GN steps) →
+**L² ≈ 4 × 10⁻⁶, L∞ ≈ 6 × 10⁻⁵**.
+
+**"Swiss cheese" — perforated square.** Unit square with four circular
+holes carved out — multiply-connected, four separate boundary
+components, smooth curved interior boundaries. The kind of domain
+meshing tools hate:
+
+```bash
+python examples/swiss_cheese_nonlin_elliptic.py --N-interior 4000 --backend cpu
+```
+
+![Swiss-cheese demo](docs/swiss_cheese.png)
+
+~15 s on CPU with 4000 interior + 640 boundary points (320 outer-square
++ 320 on the four circles) → **L² ≈ 6 × 10⁻⁶, L∞ ≈ 1 × 10⁻⁴** on the
+oscillatory manufactured solution `u = cos(2πx) · cos(2πy)`.
+
+In both examples the *code change* from the rectangular benchmark is
+exactly the point sampler. No mesh, no element assembly, no boundary
+re-derivation — the same machinery handles L-shapes, polygons with
+holes, disks with obstacles, or point clouds straight out of a CAD
+tool.
 
 ### Other PDEs
 
