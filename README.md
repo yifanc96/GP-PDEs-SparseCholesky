@@ -319,6 +319,40 @@ re-derivation — the same machinery handles L-shapes, polygons with
 holes, disks with obstacles, or point clouds straight out of a CAD
 tool.
 
+#### Geometry gallery
+
+Eight more examples under `examples/` use the same solver on
+increasingly exotic domains — each script is a self-contained
+~80-line file that describes the geometry and lets a shared helper
+run the PDE + render a three-panel figure:
+
+| script                              | what it demonstrates                       | L²        |
+| ----------------------------------- | :----------------------------------------- | --------: |
+| `flower_nonlin_elliptic.py`         | smooth non-convex, oscillating radius      | 6.5e-6    |
+| `stadium_nonlin_elliptic.py`        | mixed curved + straight segments           | 5.1e-5    |
+| `airfoil_nonlin_elliptic.py`        | NACA 0012 with box far-field (CFD-adjacent)| 4.5e-5    |
+| `porous_nonlin_elliptic.py`         | 40 random circular inclusions              | 1.8e-6    |
+| `heart_nonlin_elliptic.py`          | parametric curve (trig heart)              | 2.5e-5    |
+| `crack_nonlin_elliptic.py`          | zero-thickness horizontal slit             | 8.3e-6    |
+| `koch_nonlin_elliptic.py`           | level-4 Koch snowflake (fractal-like)      | 9.6e-5    |
+| `dumbbell_nonlin_elliptic.py`       | two disks joined by a narrow bridge        | 2.5e-5    |
+
+All use Matern 7/2 at length-scale 0.3, ρ = 3, 3 Gauss-Newton steps,
+3000 interior + a few hundred boundary points each. Every one is driven
+with `backend='cpu'`; every one works just as well with `backend='jax'`.
+
+|     |     |
+| --- | --- |
+| ![flower](docs/flower.png) | ![stadium](docs/stadium.png) |
+| ![airfoil](docs/airfoil.png) | ![porous](docs/porous.png) |
+| ![heart](docs/heart.png) | ![crack](docs/crack.png) |
+| ![koch](docs/koch.png) | ![dumbbell](docs/dumbbell.png) |
+
+Every one of these scripts is ~80 lines of Python describing the
+geometry (`in_domain`, `sample_interior`, boundary samplers) — the
+actual PDE call is a single `solve_nonlin_elliptic_2d(...)`. Swap the
+sampler for your own domain and you're done.
+
 ### Other PDEs
 
 ```python
