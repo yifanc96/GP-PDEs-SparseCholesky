@@ -98,7 +98,7 @@ def nonlin_elliptic_figure(h=0.02):
 # ---------------------------------------------------------------------------
 
 
-def sparsity_figure(N_side=40, rho=6.0):
+def sparsity_figure(N_side=40, rho=3.0):
     print(f'[fig 2] sparsity for {N_side}x{N_side} grid …')
     xs = np.linspace(0.02, 0.98, N_side)
     XX, YY = np.meshgrid(xs, xs, indexing='ij')
@@ -129,4 +129,4 @@ def sparsity_figure(N_side=40, rho=6.0):
 if __name__ == '__main__':
     os.environ.setdefault('JAX_PLATFORMS', 'cpu')
     nonlin_elliptic_figure(h=0.02)
-    sparsity_figure(N_side=40, rho=6.0)
+    sparsity_figure(N_side=40, rho=3.0)

@@ -108,7 +108,7 @@ measurements = kl.point_measurements(pts, dims=2)
 
 # 1) build the ordering + sparsity pattern (O(N log N) CPU work)
 implicit = kl.ImplicitKLFactorization.build(
-    kernel, measurements, rho=6.0, k_neighbors=1,
+    kernel, measurements, rho=3.0, k_neighbors=1,
 )
 
 # 2) materialize the factor (runs on GPU if JAX/CUDA is available)
@@ -134,11 +134,11 @@ The factor's upper-triangular sparsity after the maximin permutation
 
 ![U sparsity](docs/U_sparsity.png)
 
-Dense nnz would be `1600² = 2 560 000`. The sparse factor has ~217 000
-nonzeros (8.5 % of the dense triangle). The nnz count grows only
-linearly in N — roughly `O(N · ρᵈ)` total, `O(ρᵈ)` per column — so
-doubling N roughly halves the density fraction. That's the whole point
-of the algorithm.
+Dense nnz would be `1600² = 2 560 000`. The sparse factor has ~59 000
+nonzeros — **2.3 %** of the dense matrix — at the same ρ=3 used by the
+PDE examples below. The nnz count grows only linearly in N — roughly
+`O(N · ρᵈ)` total, `O(ρᵈ)` per column — so doubling N roughly halves
+the density fraction. That's the whole point of the algorithm.
 
 ---
 
