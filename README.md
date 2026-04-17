@@ -231,8 +231,7 @@ multi-set orderings that `kolesky.pde` invokes for you:
   coefficients, hard determinant nonlinearities). Used by
   `VarLinElliptic2d` and `MongeAmpere2d`.
 
-Which variant each PDE uses is baked in; the choice reflects what
-actually works best for each equation in the paper. The table below
+Which variant each PDE uses is baked in; the choice is made randomly for each equation in the paper. The table below
 summarizes:
 
 | PDE              | ordering variant                | measurement sets in the "big" factor              |
