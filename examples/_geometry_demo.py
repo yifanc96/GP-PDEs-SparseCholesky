@@ -48,6 +48,9 @@ def default_argparser() -> argparse.ArgumentParser:
     p.add_argument('--platform', default='cpu')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', default=None)
+    p.add_argument('--quiet', dest='verbose', action='store_false',
+                   help='suppress per-GN-step / pCG progress output')
+    p.set_defaults(verbose=True)
     return p
 
 
@@ -177,15 +180,24 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
         'Gaussian':    kl.GaussianCovariance,
     }
     kernel = kernels[args.kernel](args.sigma)
-    print(f'[kernel]  {args.kernel}, length_scale = {args.sigma}')
-    print(f'[points]  interior = {demo.X_domain.shape[0]}, boundary = {demo.X_boundary.shape[0]}')
+    d = demo.X_domain.shape[1]
+    print(f'[geometry]      {demo.name}  ({d}D)')
+    print(f'[sample points] interior = {demo.X_domain.shape[0]},  '
+          f'boundary = {demo.X_boundary.shape[0]}')
+    print(f'[kernel]        {args.kernel}, length_scale = {args.sigma}')
+    print(f'[nugget]        {args.nugget}')
+    print(f'[GN steps]      {args.GN_steps}')
+    print(f'[fast Cholesky] rho_big={args.rho}, rho_small={args.rho}, '
+          f'k_neighbors={args.k_neighbors}, backend={args.backend}')
 
-    # `domain` is only used by the 2D grid sampler; the solver itself is
-    # d-agnostic and never touches it. We pass a 2D bbox unconditionally.
-    bx = (demo.X_domain[:, 0].min(), demo.X_domain[:, 0].max())
-    by = (demo.X_domain[:, 1].min(), demo.X_domain[:, 1].max())
+    # The solver is d-agnostic and only reads ``X_domain`` / ``X_boundary``;
+    # ``domain`` is kept on the dataclass as a bounding-box annotation.
+    axes = tuple(
+        (float(demo.X_domain[:, i].min()), float(demo.X_domain[:, i].max()))
+        for i in range(d)
+    )
     eqn = NonlinElliptic(
-        alpha=demo.alpha, m=demo.m, domain=(bx, by),
+        alpha=demo.alpha, m=demo.m, domain=axes,
         bdy=demo.u_exact, rhs=demo.rhs,
     )
     t0 = time.perf_counter()
@@ -194,16 +206,16 @@ def run_and_plot(demo: GeometryDemo, args) -> dict:
         sol_init=np.zeros(demo.X_domain.shape[0]),
         nugget=args.nugget, GN_steps=args.GN_steps,
         rho_big=args.rho, rho_small=args.rho, k_neighbors=args.k_neighbors,
-        backend=args.backend, verbose=False,
+        backend=args.backend, verbose=args.verbose,
     )
     t1 = time.perf_counter()
-    print(f'[solve]   {t1 - t0:.3f} s')
+    print(f'[fast solve]    wall time: {t1 - t0:.3f} s')
 
     out = pathlib.Path(args.out) if args.out else pathlib.Path(f'docs/{demo.name}.png')
     if demo.X_domain.shape[1] == 3:
         L2, Linf = plot_three_panel_3d(demo, sol, out)
     else:
         L2, Linf = plot_three_panel(demo, sol, out)
-    print(f'[error]   L² = {L2:.3e}, L∞ = {Linf:.3e}')
-    print(f'[figure]  {out}')
+    print(f'[accuracy]      L² = {L2:.3e},  L∞ = {Linf:.3e}')
+    print(f'[figure]        {out}')
     return {'wall': t1 - t0, 'L2': L2, 'Linf': Linf}
