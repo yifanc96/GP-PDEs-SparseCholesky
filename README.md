@@ -129,40 +129,64 @@ These are precisely the linearizations the PDE solvers below feed in:
 
 ## Part 2 — `kolesky.pde`: Gauss-Newton + pCG PDE solver
 
-Each PDE is reduced to a sequence of linear GP regressions (one per
-Gauss-Newton step). Inside each, pCG drives the solve:
+Each PDE is reduced to a sequence of linear GP regressions — one per
+Gauss-Newton (GN) step. You supply: domain, right-hand side, boundary
+data, initial iterate. With `backend='auto'` the heavy factorization
+runs on GPU whenever JAX resolves to a CUDA device.
 
-- the sparse factor is the **fast matvec** for `Θ_train @ v` (since
-  `Θ_train` is an inner block of a bigger `Θ_big`, whose factor is
-  built once outside the GN loop);
-- the sparse factor of `Θ_train` itself is the **preconditioner**.
+### The two kernel matrices
 
-You supply: domain, right-hand side, boundary data, initial iterate.
-With `backend='auto'` the heavy factorization runs on GPU whenever JAX
-resolves to a CUDA device.
+At every GN step there are two kernel matrices, both too dense to form
+explicitly at `N ≫ 10³`. Each gets its own sparse Cholesky factor.
+
+| matrix     | what it is                                                                                                                                                                                                                                   | role inside pCG                                             |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `Θ_train`  | kernel matrix over the *training* measurements `[ δ_bdy , L_int ]`, where `L` is the linearized PDE operator at the current iterate. The linear system `Θ_train · α = rhs` is what pCG solves each GN step.                                  | small sparse factor ⇒ **preconditioner**                    |
+| `Θ_big`    | kernel matrix over the *union* of all measurement types ever needed: boundary δ, interior δ (the quantities we want to predict), and each derivative operator that appears in `L` (Δ, ∇, ∂ᵢⱼ, …). Built *once* over a canonical 3- / 4- / 5-set list. | big sparse factor ⇒ **fast matvec** for `Θ_train · v`       |
+
+**Why two matrices?** Across GN steps the *weights* of `L` change
+(e.g. the reaction term `c(x) = α·m·vᵐ⁻¹(x)`), but the *measurement
+types and locations* do not. So `Θ_train` at every GN step is a linear
+combination of fixed sub-blocks of `Θ_big`. Given the sparse factor of
+`Θ_big`, we compute `Θ_train · v` via a **lift – apply – extract**
+pattern:
+
+1. **lift** `v` (length `N_bdy + N_int`) up to length `N_bdy + k · N_int`,
+   replicating the interior block once per non-δ measurement type with
+   the current operator weights;
+2. **apply** `Θ_big` to the lifted vector via its sparse factor
+   (two triangular solves);
+3. **extract** the same-sized block back out.
+
+`LiftedThetaTrainMatVec` does this. The expensive `Θ_big` factor is
+built **once outside the GN loop** and reused; only a cheap 2-set
+`Θ_train` factor gets rebuilt each GN step to serve as the pCG
+preconditioner.
 
 ### Ordering multi-set measurements
 
-Plain maximin is ill-defined when PDE problems have **co-located
-measurement groups** — e.g. both `u(xᵢ)` and `Δu(xᵢ)` at every
-interior point, distance zero. Two canonical variants:
+Plain reverse-maximin is ill-defined when PDE problems have
+**co-located measurement groups** — e.g. both `u(xᵢ)` and `Δu(xᵢ)` at
+every interior point, distance zero. Two canonical variants:
 
 - **FollowDiracs** — maximin on `(boundary δ, interior δ)`, then insert
   each derivative measurement immediately after its δ. Keeps co-located
-  `(δ, Δδ)` pairs in the same supernode. We found this perform better and lead to sparser factor in our experiments. *Used by `NonlinElliptic2d`
-  and `Burgers1d`.*
+  `(δ, Δδ)` pairs in the same supernode. We found this performs better
+  and leads to a sparser factor in our experiments. *Used by
+  `NonlinElliptic2d` and `Burgers1d`.*
 - **DiracsFirstThenUnifScale** — same maximin step, then append each
-  derivative block at the finest length scale. The case that is theoretically proved in our paper. *Used by `VarLinElliptic2d` and `MongeAmpere2d`.*
+  derivative block at the finest length scale. This is the variant
+  theoretically analyzed in our paper. *Used by `VarLinElliptic2d` and
+  `MongeAmpere2d`.*
 
-| PDE                 | ordering                      | big-factor measurement sets               |
-| ------------------- | ----------------------------- | ----------------------------------------- |
-| `NonlinElliptic2d`  | FollowDiracs (3 sets)         | δ_bdy, δ_int, −Δ_int                       |
-| `VarLinElliptic2d`  | DiracsFirstThenUnifScale (3)  | δ_bdy, δ_int, `−a∆ − ∇a·∇` on int          |
-| `Burgers1d`         | FollowDiracs (4 sets)         | δ_bdy, δ_int, ∇_int, Δ_int                  |
-| `MongeAmpere2d`     | DiracsFirstThenUnifScale (5)  | δ_bdy, δ_int, ∂₁₁, ∂₂₂, ∂₁₂                 |
+The measurement set for `Θ_big` is baked into each solver:
 
-Each GN step reuses the "big" factor and rebuilds only a small 2-set
-(boundary δ, linearized-PDE) factor as a preconditioner.
+| PDE                 | ordering                      | `Θ_big` measurement sets                    |
+| ------------------- | ----------------------------- | ------------------------------------------- |
+| `NonlinElliptic2d`  | FollowDiracs (3 sets)         | δ_bdy, δ_int, −Δ_int                         |
+| `VarLinElliptic2d`  | DiracsFirstThenUnifScale (3)  | δ_bdy, δ_int, `−a∆ − ∇a·∇` on int            |
+| `Burgers1d`         | FollowDiracs (4 sets)         | δ_bdy, δ_int, ∇_int, Δ_int                    |
+| `MongeAmpere2d`     | DiracsFirstThenUnifScale (5)  | δ_bdy, δ_int, ∂₁₁, ∂₂₂, ∂₁₂                   |
 
 ### Quickstart: `−Δu + α uᵐ = f` on `[0,1]²`
 
