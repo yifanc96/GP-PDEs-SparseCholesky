@@ -258,17 +258,35 @@ If your operator involves a linear functional `L` the built-in
 dataclasses don't cover (biharmonic `Δ²u`, mixed third derivatives, 3-D
 Hessian, curl …), you need to:
 
-1. add a dataclass in `kolesky/measurements.py` with the weight fields
-   `L` uses;
-2. add `stack_measurements` / `select` branches for it;
-3. implement the kernel pair evaluator `K(Lₓ, Lᵧ)` in
-   `kolesky/covariance.py` — analytically differentiate the Matérn
-   radial function twice (once per side of `L`). The existing
-   `_np_ldld` (Δδ × Δδ) and `_np_lgdlgd` (Δ∇δ × Δ∇δ) paths are templates.
+1. **Add a dataclass** in `kolesky/measurements.py` with the weight
+   fields `L` uses. Supply a `.d` property and an `.is_batched()`
+   method so the rest of the pipeline (ordering, supernodes,
+   factorization) treats it uniformly with the built-ins.
+2. **Extend two helpers** in the same file — `stack_measurements`
+   concatenates a list of batched measurements of one type along the
+   batch axis (used whenever a multi-set group is merged into one
+   training set); `select(m, idx)` returns the rows `idx` of a batched
+   measurement (used by the maximin / supernode logic to grab a
+   sub-point-cloud without copying every weight field). Both are plain
+   `if cls is …:` dispatch tables; add a branch for your new dataclass
+   so it round-trips through the factorization.
+3. **Implement the kernel pair evaluator** `K(Lₓ, Lᵧ)` in
+   `kolesky/covariance.py`. Two routes:
+   - *Analytic* — differentiate the Matérn radial twice by hand (once
+     per side of `L`) and plug into a broadcast NumPy evaluator. The
+     existing `_np_ldld` (Δδ × Δδ) and `_np_lgdlgd` (Δ∇δ × Δ∇δ) paths
+     are templates. Fast at runtime, no per-pair JIT.
+   - *Autodiff* — let JAX compute `L₁ L₂ K(x, y)` via `jax.grad`,
+     `jax.hessian`, `jax.jvp`, etc.; `MongeAmpere2d`'s Hessian kernel
+     already takes this route (see the HessianDirac evaluator in
+     `covariance.py`). Much less code, but slower: each supernode-size
+     bucket JIT-compiles its own autodiff graph, and nested
+     `jax.hessian` is expensive. Generally fine if your operator is
+     rarely exercised or for a first prototype.
 
 The Julia reference [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl)
-has more measurement types (e.g. higher-order derivatives) if you need
-a starting point.
+has more measurement types (higher-order derivatives, etc.) if you
+need a starting point for the analytic route.
 
 ---
 
