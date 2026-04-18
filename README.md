@@ -425,6 +425,27 @@ matches CPU SciPy.
 GPU advantage grows with N: ~2.4× at N≈2 600, ~2.8× at N≈10 200 in the
 `NonlinElliptic2d` column.
 
+### Comparison vs the Julia reference
+
+Head-to-head against the original
+[PDEs-GP-KoleskySolver](https://github.com/yifanc96/GP-PDEs-SparseCholesky/tree/initial-julia-code)
+on the same machine (AMD EPYC 9554 / single NVIDIA H200) at matched
+parameters (Matern 7/2, σ=0.3, ρ_big=4, ρ_small=6, k_neighbors=4,
+3 Gauss-Newton steps):
+
+| NonlinElliptic, h | N      | Julia CPU³ | Python CPU | Python GPU | Python L² |
+| ----------------: | -----: | ---------: | ---------: | ---------: | --------: |
+| 0.02              |  2 600 | **1.4 s**  | 4.2 s      | 2.4 s      | 2.2e-5    |
+| 0.01              | 10 200 | **6.0 s**  | 20.0 s     | 14.8 s     | 1.2e-6    |
+
+³ Julia 1.11, IntelVectorMath/MKL. Matches `iterGPR_fast_pcg` in
+`main_NonLinElliptic2d.jl` with the `@elapsed` warm call (compilation
+excluded). Julia is ~3× faster on CPU (MKL vs OpenBLAS + JIT-compiled
+inner loops); the Python path catches up asymptotically in N on GPU
+because the batched-Cholesky dispatch amortizes better as supernodes
+grow. Accuracy is identical across backends (same algorithm + ordering;
+the small error difference is the nondeterministic maximin random-seed).
+
 ---
 
 ## License
