@@ -149,12 +149,10 @@ interior point, distance zero. Two canonical variants:
 
 - **FollowDiracs** — maximin on `(boundary δ, interior δ)`, then insert
   each derivative measurement immediately after its δ. Keeps co-located
-  `(δ, Δδ)` pairs in the same supernode. *Used by `NonlinElliptic2d`
+  `(δ, Δδ)` pairs in the same supernode. We found this perform better and lead to sparser factor in our experiments. *Used by `NonlinElliptic2d`
   and `Burgers1d`.*
 - **DiracsFirstThenUnifScale** — same maximin step, then append each
-  derivative block at the finest length scale. Better when the spatial
-  operator dominates (oscillating coefficients, determinant
-  nonlinearities). *Used by `VarLinElliptic2d` and `MongeAmpere2d`.*
+  derivative block at the finest length scale. The case that is theoretically proved in our paper. *Used by `VarLinElliptic2d` and `MongeAmpere2d`.*
 
 | PDE                 | ordering                      | big-factor measurement sets               |
 | ------------------- | ----------------------------- | ----------------------------------------- |
