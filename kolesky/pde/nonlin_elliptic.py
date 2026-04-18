@@ -226,11 +226,14 @@ def iterGPR_exact(
     nugget: float = 1e-10,
     GN_steps: int = 3,
 ) -> np.ndarray:
-    """Exact version via dense covariance matrices (small N only)."""
+    """Exact version via dense covariance matrices (small N only).
+
+    Works in any spatial dimension ``d``; the measurements / kernels
+    infer ``d`` from ``X_domain.shape[1]`` themselves.
+    """
     from .. import measurements as _m
     N_dom = X_domain.shape[0]
     N_bdy = X_boundary.shape[0]
-    d = 2
 
     rhs_values = _apply_vector_rhs(eqn.rhs, X_domain)
     bdy_values = _apply_vector_rhs(eqn.bdy, X_boundary)

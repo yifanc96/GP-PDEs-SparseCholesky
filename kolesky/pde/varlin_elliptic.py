@@ -3,17 +3,18 @@
 -∇·(a(x) ∇u(x)) + α u(x)^m = f(x)  on Ω
 u = bdy  on ∂Ω
 
-The solver is dimension-agnostic: Δ∇δ measurements (Laplacian +
-gradient + Dirac) generalize naturally since the gradient weight is a
-`d`-vector. The big factor uses the DiracsFirstThenUnifScale ordering
-rather than FollowDiracs. Mirrors main_VarLinElliptic2d.jl.
+Dimension-agnostic: the Δ∇δ measurement (Laplacian + gradient + Dirac)
+generalizes naturally since the gradient weight is a `d`-vector, and
+the maximin ordering / sparsity pattern use Euclidean distance in any
+`d`. The big factor uses the DiracsFirstThenUnifScale ordering rather
+than FollowDiracs. Mirrors main_VarLinElliptic2d.jl.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable
 
 import numpy as np
 import scipy.sparse
@@ -27,6 +28,7 @@ from .. import (
 )
 from ..measurements import LaplaceGradDiracPointMeasurement
 
+from .pdes import DomainBBox
 from .pcg_ops import (
     BigFactorOperator,
     LiftedThetaTrainMatVec,
@@ -36,9 +38,17 @@ from .pcg_ops import (
 
 @dataclass
 class VarLinElliptic:
+    """-∇·(a(x) ∇u(x)) + α u(x)^m = f(x).
+
+    Works for any spatial dimension ``d`` — ``domain`` is a length-``d``
+    tuple of ``(lo, hi)`` pairs and is *optional* (the solver only looks
+    at the ``X_domain`` / ``X_boundary`` point clouds and infers ``d``
+    from their second axis).
+    """
+
     alpha: float
     m: int
-    domain: Tuple[Tuple[float, float], Tuple[float, float]]
+    domain: DomainBBox
     a: Callable          # a(x) -> float
     grad_a: Callable     # grad_a(x) -> (d,) array
     bdy: Callable
@@ -46,7 +56,7 @@ class VarLinElliptic:
 
     @property
     def d(self) -> int:
-        return 2
+        return len(self.domain)
 
 
 def _make_measurements_big(
@@ -140,7 +150,7 @@ def solve_var_lin_elliptic(
     rhs_values = _apply_vector_rhs(eqn.rhs, X_domain)
     bdy_values = _apply_vector_rhs(eqn.bdy, X_boundary)
     lap_coefs = -_apply_vector_rhs(eqn.a, X_domain)           # (N_dom,)
-    grad_coefs = -_apply_grad(eqn.grad_a, X_domain)           # (N_dom, 2)
+    grad_coefs = -_apply_grad(eqn.grad_a, X_domain)           # (N_dom, d)
 
     sol_now = np.asarray(sol_init, dtype=np.float64).copy()
 
