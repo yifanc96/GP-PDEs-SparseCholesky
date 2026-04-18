@@ -83,7 +83,8 @@ ratio shrinks as N grows. Figure produced by
 ### Quickstart
 
 ```python
-import numpy as np, kolesky as kl
+import numpy as np, scipy.sparse.linalg as spla
+import kolesky as kl
 
 # 40×40 grid on [0,1]²
 xs  = np.linspace(0.02, 0.98, 40)
@@ -97,11 +98,27 @@ explicit = kl.ExplicitKLFactorization(implicit, nugget=1e-8, backend='auto')
 
 U, P = explicit.U, explicit.P   # U: scipy.sparse.csc_matrix;  P: np.ndarray[int64]
 print(f'N = {U.shape[0]},  nnz = {U.nnz}')
+
+# Verify: Θ v  ≈  (dense) K v
+v  = np.random.default_rng(0).standard_normal(U.shape[0])
+vp = v[P]
+y  = spla.spsolve_triangular(U.tocsr(),   vp, lower=False)
+z  = spla.spsolve_triangular(U.T.tocsr(), y,  lower=True)
+Theta_v = np.empty_like(v); Theta_v[P] = z
+print('rel err:', np.linalg.norm(Theta_v - kernel(meas) @ v) / np.linalg.norm(kernel(meas) @ v))
+```
+
+Output at N = 1600, ρ = 3:
+
+```
+N = 1600,  nnz = 59104
+rel err: 2.15e-02
 ```
 
 The factor is stored in the P-permuted order; all built-in
 matvec/solve routines permute automatically. When using `U` by hand,
-remember `Θ v ≈ P Uᵀ⁻¹ U⁻¹ Pᵀ v`.
+remember `Θ v ≈ P Uᵀ⁻¹ U⁻¹ Pᵀ v` (exactly what the verification block
+above computes).
 
 ### What do those knobs mean?
 
