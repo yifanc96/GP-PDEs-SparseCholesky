@@ -103,6 +103,52 @@ The factor is stored in the P-permuted order; all built-in
 matvec/solve routines permute automatically. When using `U` by hand,
 remember `Θ v ≈ P Uᵀ⁻¹ U⁻¹ Pᵀ v`.
 
+### What do those knobs mean?
+
+The quickstart had four parameters that quietly do all the work:
+
+- **`ImplicitKLFactorization.build(...)`** — *stage 1 of the
+  factorization.* Computes the **reverse-maximin ordering** of the
+  points (coarse scales first, fine last) and the **sparsity pattern**
+  of the factor (which entries of `U` will be nonzero). Graph-theoretic
+  work only, CPU, `O(N log N)` ish. Doesn't touch the kernel values
+  yet, so it's cheap and can be reused across different kernels or
+  nuggets.
+
+- **`ExplicitKLFactorization(implicit, nugget=..., backend=...)`** —
+  *stage 2.* Fills in the actual numbers: for each column group
+  (a "supernode"), evaluate the local kernel matrix, add the nugget to
+  the diagonal, Cholesky-factorize it, and write the resulting
+  sub-columns into `U`. This is where all the arithmetic happens; it's
+  what runs on GPU when `backend='jax'`.
+
+- **`rho`** (aka ρ) — *accuracy ↔ cost knob.* At each column, only
+  points within `ρ × ℓ_i` get a nonzero entry (where `ℓ_i` is that
+  point's maximin length scale). Bigger ρ → denser factor, more
+  accurate; cost scales like `O(N · ρᵈ)`. **ρ = 3 is the sweet spot**
+  for the PDE examples in this README; empirically the relative
+  forward-matvec error `‖Θv − Kv‖ / ‖Kv‖` decays roughly
+  exponentially with ρ (≈ 2 × 10⁻² at ρ = 3, ≈ 5 × 10⁻³ at ρ = 4 on
+  Matern 5/2). Every additional unit of ρ trades a factor of `~ρᵈ`
+  more nnz for roughly an order of magnitude in accuracy.
+
+- **`k_neighbors`** — *supernodal grouping knob.* Columns whose
+  sparsity patterns are nearly identical get batched into one
+  supernode so their Cholesky factorizations share work. `k_neighbors`
+  controls how aggressively this happens — higher values merge more
+  columns per supernode (faster total, slightly denser factor).
+  `k_neighbors = 1` means no merging; `k = 3` is the usual default for
+  PDE problems. Affects speed, not correctness.
+
+- **`nugget`** — *diagonal regularization.* A small `nugget · I` is
+  added to each local kernel block before the Cholesky. Covariance
+  matrices are typically numerically semi-definite at machine
+  precision (especially for small kernel length scales or densely
+  packed points); the nugget keeps Cholesky happy. Typical values:
+  `1e-10` when you have plenty of conditioning headroom, up to `1e-6`
+  or `1e-4` when you don't. Bigger nugget ⇒ more stable, less
+  accurate.
+
 ### Derivative measurements (beyond point values)
 
 Everything works for **any** linear functional of the GP, not just
