@@ -430,21 +430,21 @@ GPU advantage grows with N: ~2.4× at N≈2 600, ~2.8× at N≈10 200 in the
 Head-to-head against the original
 [PDEs-GP-KoleskySolver](https://github.com/yifanc96/GP-PDEs-SparseCholesky/tree/initial-julia-code)
 on the same machine (AMD EPYC 9554 / single NVIDIA H200) at matched
-parameters (Matern 7/2, σ=0.3, ρ_big=4, ρ_small=6, k_neighbors=4,
+parameters (Matern 7/2, σ=0.3, ρ_big = ρ_small = 3, k_neighbors = 3,
 3 Gauss-Newton steps):
 
-| NonlinElliptic, h | N      | Julia CPU³ | Python CPU | Python GPU | Python L² |
-| ----------------: | -----: | ---------: | ---------: | ---------: | --------: |
-| 0.02              |  2 600 | **1.4 s**  | 4.2 s      | 2.4 s      | 2.2e-5    |
-| 0.01              | 10 200 | **6.0 s**  | 20.0 s     | 14.8 s     | 1.2e-6    |
+| NonlinElliptic, h | N      | Julia CPU³ | Python CPU | Python GPU | L² error |
+| ----------------: | -----: | ---------: | ---------: | ---------: | -------: |
+| 0.02              |  2 400 | **1.3 s**  | 3.7 s      | 1.7 s      | ~2e-5    |
+| 0.01              |  9 800 | **6.5 s**  | 16.7 s     | 7.8 s      | ~6e-6    |
 
 ³ Julia 1.11, IntelVectorMath/MKL. Matches `iterGPR_fast_pcg` in
-`main_NonLinElliptic2d.jl` with the `@elapsed` warm call (compilation
-excluded). Julia is ~3× faster on CPU (MKL vs OpenBLAS + JIT-compiled
-inner loops); the Python path catches up asymptotically in N on GPU
-because the batched-Cholesky dispatch amortizes better as supernodes
-grow. Accuracy is identical across backends (same algorithm + ordering;
-the small error difference is the nondeterministic maximin random-seed).
+`main_NonLinElliptic2d.jl`; `@elapsed` warm call, compilation excluded.
+At matched ρ = 3 (the value used in every example in this README),
+Python on GPU gets within ~1.2× of Julia on CPU; on CPU the Python port
+is ~3× slower, mostly the BLAS difference (MKL vs OpenBLAS) and the
+lack of JIT'd inner loops. Accuracy is the same order across all three
+paths; tiny differences come from the nondeterministic maximin seed.
 
 ---
 
