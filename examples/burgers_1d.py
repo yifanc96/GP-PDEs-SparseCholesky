@@ -98,7 +98,7 @@ def main(argv=None):
         dt=args.dt, T=args.T, nugget=args.nugget, GN_steps=args.GN_steps,
         rho_big=args.rho_big, rho_small=args.rho_small,
         k_neighbors=args.k_neighbors, backend=args.backend,
-        verbose=False,
+        verbose=True,
     )
     t1 = time.perf_counter()
     print(f'[fast solve] wall time: {t1 - t0:.3f} s')

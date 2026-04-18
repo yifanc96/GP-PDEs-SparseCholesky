@@ -101,8 +101,9 @@ def _process_one_supernode(node, kernel, measurements, nugget, U_indptr, U_data)
     if I.size == 0 or C.size == 0:
         return
     m_I = _m.select(measurements, I)
-    K = np.asarray(kernel(m_I, m_I), dtype=np.float64)
-    K = np.ascontiguousarray(K)
+    # ``np.array(..., copy=True)`` ensures a writeable, owned buffer — some
+    # kernels return JAX-backed arrays that are read-only once wrapped.
+    K = np.array(kernel(m_I, m_I), dtype=np.float64, copy=True, order='C')
     if nugget != 0.0:
         d = np.arange(K.shape[0])
         K[d, d] *= (1.0 + nugget)

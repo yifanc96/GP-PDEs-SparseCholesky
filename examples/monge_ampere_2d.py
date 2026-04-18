@@ -94,6 +94,7 @@ def main(argv=None):
             nugget=args.nugget, GN_steps=args.GN_steps,
             rho_big=args.rho_big, rho_small=args.rho_small,
             k_neighbors=args.k_neighbors, backend=args.backend,
+            verbose=True,
         )
 
     t0 = time.perf_counter()
