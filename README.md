@@ -171,6 +171,79 @@ These are precisely the linearizations the PDE solvers below feed in:
 - `uₜ + u uₓ − ν uₓₓ = 0` (Crank-Nicolson): Δ∇δ in 1D.
 - `det(∇²u) = f`: ∂∂ measurement after linearization.
 
+#### Worked example: factorize `K` over boundary δ + interior Δ
+
+```python
+import numpy as np, scipy.sparse.linalg as spla
+import kolesky as kl
+from kolesky import LaplaceDiracPointMeasurement
+
+# 19×19 interior grid (Laplacian measurements) + grid boundary (Dirac).
+h  = 0.05
+xs = np.arange(h, 1 - h + 1e-12, h)
+XX, YY   = np.meshgrid(xs, xs, indexing='ij')
+interior = np.stack([XX.ravel(), YY.ravel()], axis=1)                      # (N_int, 2)
+bt       = np.arange(0, 1 + 1e-12, h)
+z, o     = np.zeros_like(bt), np.ones_like(bt)
+boundary = np.unique(np.vstack([np.c_[bt, z], np.c_[bt, o],
+                                np.c_[z, bt], np.c_[o, bt]]), axis=0)      # (N_bdy, 2)
+N_int, N_bdy = len(interior), len(boundary)
+
+# Two measurement groups:
+m_bdy = LaplaceDiracPointMeasurement(                   # u(x_i)   (Dirichlet)
+    coordinate=boundary,
+    weight_laplace=np.zeros(N_bdy), weight_delta=np.ones(N_bdy),
+)
+m_lap = LaplaceDiracPointMeasurement(                   # −Δu(x_j)
+    coordinate=interior,
+    weight_laplace=-np.ones(N_int), weight_delta=np.zeros(N_int),
+)
+
+kernel   = kl.MaternCovariance7_2(length_scale=0.2)
+
+# Multi-set build: pass a *list* of measurement groups. Plain `build` works
+# because the two groups live at different locations (boundary vs interior —
+# no co-location). For groups with co-located δ/Δδ pairs, use
+# `.build_follow_diracs(...)` or `.build_diracs_first_then_unif_scale(...)`.
+implicit = kl.ImplicitKLFactorization.build(kernel, [m_bdy, m_lap],
+                                            rho=3.0, k_neighbors=3)
+explicit = kl.ExplicitKLFactorization(implicit, nugget=1e-10, backend='cpu')
+
+U, P = explicit.U, explicit.P
+print(f'N = {N_bdy + N_int},  U.nnz = {U.nnz}')
+
+# Verify: Θ v  ≈  (dense) K v
+all_meas = kl.stack_measurements([m_bdy, m_lap])      # (N_bdy + N_int, 2)
+K = kernel(all_meas)                                  # dense (same size)
+
+v  = np.random.default_rng(0).standard_normal(K.shape[0])
+vp = v[P]
+y  = spla.spsolve_triangular(U.tocsr(),   vp, lower=False)
+z  = spla.spsolve_triangular(U.T.tocsr(), y,  lower=True)
+Theta_v = np.empty_like(v); Theta_v[P] = z
+print('rel err:', np.linalg.norm(Theta_v - K @ v) / np.linalg.norm(K @ v))
+```
+
+Output at N = 441:
+
+```
+N = 441,  U.nnz = 19558
+rel err: 6.09e-02
+```
+
+Take-aways:
+
+- **Pass a list of measurement groups**, one per kind, to `.build`. Each
+  group is itself batched (shape `(N_k, d)` coordinates + weights);
+  `kolesky` figures out where each group sits in the ordering.
+- `stack_measurements` merges those groups into one batched measurement,
+  which is also what you apply a kernel to (`kernel(all_meas)` gives
+  the full `(N × N)` covariance in the same row order the factor uses).
+- For co-located groups (δ and Δδ at the *same* interior points, as in
+  PDE solves), use `.build_follow_diracs(...)` or
+  `.build_diracs_first_then_unif_scale(...)` instead — plain maximin
+  would see distance-zero ties. See Part 2 for details.
+
 ---
 
 ## Part 2 — `kolesky.pde`: Gauss-Newton + pCG PDE solver
