@@ -203,6 +203,73 @@ from kolesky.pde import (
 See [`examples/`](examples/) for runnable scripts that mirror the Julia
 reference code.
 
+### Bring your own PDE
+
+The four built-in solvers (`NonlinElliptic`, `VarLinElliptic`,
+`Burgers1d`, `MongeAmpere2d`) cover a lot, but if your PDE isn't one of
+them you build a new solver out of three low-level pieces in
+`kolesky.pde.pcg_ops`:
+
+| piece                    | role                                                                 |
+| ------------------------ | -------------------------------------------------------------------- |
+| `BigFactorOperator`      | applies `Θ_big` to a dense vector (two sparse triangular solves)     |
+| `LiftedThetaTrainMatVec` | assembles `Θ_train` from `Θ_big` without materializing it            |
+| `SmallPrecond`           | applies `Θ_train⁻¹` via the small sparse factor (two sparse matvecs) |
+
+The **four-step recipe** every built-in solver follows:
+
+1. **Pick measurements.** A measurement is a linear functional of `u`
+   applied at a point. Match your operator:
+
+   | operator terms you need  | measurement                                              |
+   | ------------------------ | -------------------------------------------------------- |
+   | `u` only                 | `PointMeasurement`                                       |
+   | `Δu`, `u`                | `LaplaceDiracPointMeasurement` (weights `w_Δ`, `w_δ`)    |
+   | `Δu`, `∇u`, `u`          | `LaplaceGradDiracPointMeasurement` (+ `w_∇` is a `d`-vec)|
+   | `∂ᵢⱼu` in 2D             | `HessianDiracPointMeasurement` (2D only)                 |
+   | anything else            | write a new dataclass + kernel pair evaluator (see below)|
+
+2. **Build the big factor** with the multi-set measurement list
+   `(δ_bdy, δ_int, L_int …)` — call `ImplicitKLFactorization.build_follow_diracs`
+   or `.build_diracs_first_then_unif_scale`, then `ExplicitKLFactorization`.
+   This is the expensive step; do it once.
+
+3. **Build a small preconditioner factor** on the 2-set list `(δ_bdy,
+   L_int)` where `L` is the full linear(ized) operator.
+
+4. **pCG solve.** Wrap the big factor in `LiftedThetaTrainMatVec` and
+   the small factor in `SmallPrecond`, then `scipy.sparse.linalg.cg`
+   drives `Θ_train · α = rhs` in ~10–50 iters. Prediction at interior
+   points is one final `Θ_big · lift(α)`.
+
+For **nonlinear PDEs**, wrap steps 3–4 in a Gauss-Newton loop that
+updates the operator's weights on each iterate — see
+[`kolesky/pde/nonlin_elliptic.py`](kolesky/pde/nonlin_elliptic.py).
+
+A ~80-line runnable template for a **linear reaction-diffusion**
+`−Δu + c(x)·u = f(x)` lives at
+[`examples/custom_pde_minimal.py`](examples/custom_pde_minimal.py).
+Start from there, change `c(x)`, `f(x)`, the boundary data, and (if
+needed) the measurement weights.
+
+### When you need a new measurement type
+
+If your operator involves a linear functional `L` the built-in
+dataclasses don't cover (biharmonic `Δ²u`, mixed third derivatives, 3-D
+Hessian, curl …), you need to:
+
+1. add a dataclass in `kolesky/measurements.py` with the weight fields
+   `L` uses;
+2. add `stack_measurements` / `select` branches for it;
+3. implement the kernel pair evaluator `K(Lₓ, Lᵧ)` in
+   `kolesky/covariance.py` — analytically differentiate the Matérn
+   radial function twice (once per side of `L`). The existing
+   `_np_ldld` (Δδ × Δδ) and `_np_lgdlgd` (Δ∇δ × Δ∇δ) paths are templates.
+
+The Julia reference [KoLesky.jl](https://github.com/f-t-s/KoLesky.jl)
+has more measurement types (e.g. higher-order derivatives) if you need
+a starting point.
+
 ---
 
 ## Geometry gallery (2D + 3D)
