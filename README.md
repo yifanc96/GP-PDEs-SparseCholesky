@@ -256,34 +256,108 @@ Gauss-Newton (GN) step. You supply: domain, right-hand side, boundary
 data, initial iterate. With `backend='auto'` the heavy factorization
 runs on GPU whenever JAX resolves to a CUDA device.
 
-### The two kernel matrices
+### Where `Θ_train` and `Θ_big` come from — walked through on `−Δu + α uᵐ = f`
 
-At every GN step there are two kernel matrices, both too dense to form
-explicitly at `N ≫ 10³`. Each gets its own sparse Cholesky factor.
+Take the nonlinear elliptic PDE `−Δu + α uᵐ = f` on Ω with Dirichlet
+BCs `u = g on ∂Ω`. Sample `N_bdy` boundary points `{xᵢᵇ}` and `N_int`
+interior points `{xⱼⁱ}`.
 
-| matrix     | what it is                                                                                                                                                                                                                                   | role inside pCG                                             |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `Θ_train`  | kernel matrix over the *training* measurements `[ δ_bdy , L_int ]`, where `L` is the linearized PDE operator at the current iterate. The linear system `Θ_train · α = rhs` is what pCG solves each GN step.                                  | small sparse factor ⇒ **preconditioner**                    |
-| `Θ_big`    | kernel matrix over the *union* of all measurement types ever needed: boundary δ, interior δ (the quantities we want to predict), and each derivative operator that appears in `L` (Δ, ∇, ∂ᵢⱼ, …). Built *once* over a canonical 3- / 4- / 5-set list. | big sparse factor ⇒ **fast matvec** for `Θ_train · v`       |
+**Step 1 — Gauss-Newton linearization.** Define `F(u) = −Δu + α uᵐ −
+f`. Around a current iterate `v`,
 
-**Why two matrices?** Across GN steps the *weights* of `L` change
-(e.g. the reaction term `c(x) = α·m·vᵐ⁻¹(x)`), but the *measurement
-types and locations* do not. So `Θ_train` at every GN step is a linear
-combination of fixed sub-blocks of `Θ_big`. Given the sparse factor of
-`Θ_big`, we compute `Θ_train · v` via a **lift – apply – extract**
-pattern:
+    F(u) ≈ F(v) + F'(v) (u − v),
 
-1. **lift** `v` (length `N_bdy + N_int`) up to length `N_bdy + k · N_int`,
-   replicating the interior block once per non-δ measurement type with
-   the current operator weights;
-2. **apply** `Θ_big` to the lifted vector via its sparse factor
+so setting `F(u) = 0` gives a *linear* problem for `u`:
+
+    −Δu(x) + c(x)·u(x) = f(x) + α(m−1)·v(x)ᵐ    on interior,     u = g   on ∂Ω,
+
+with the spatially varying coefficient `c(x) = α·m·v(x)ᵐ⁻¹`. Each GN
+step is this linear PDE — only `c(x)` and the right-hand side change
+from step to step.
+
+**Step 2 — GP regression as the solver.** Place a GP prior
+`u ~ N(0, K)` and impose the linearized equations as linear
+functionals of `u` at the collocation points:
+
+| at point               | linear functional `Lu`          | value    | measurement type         |
+| ---------------------- | ------------------------------- | -------- | ------------------------ |
+| `xᵢᵇ` (boundary)       | `u(xᵢᵇ)`                        | `g(xᵢᵇ)` | pure δ                   |
+| `xⱼⁱ` (interior)       | `−Δu(xⱼⁱ) + c(xⱼⁱ)·u(xⱼⁱ)`      | rhsⱼ     | **Δδ** with weights `w_Δ = −1`, `w_δ = c(xⱼⁱ)` |
+
+Stack them into one training vector
+`train = [δ_bdy, (−Δ + c·δ)_int]` of length `N_bdy + N_int`. The
+posterior mean of `u` at interior points, which is the next GN iterate,
+is the standard GP answer
+
+    u(xⁱ) = K(δ_{xⁱ}, train) · Θ_train⁻¹ · rhs,                       (∗)
+
+where
+
+> **`Θ_train` = K(train, train)** — the `(N_bdy + N_int)²` kernel
+> matrix over the *linearized* training measurements at the current
+> iterate `v`.
+
+This is what pCG inverts, once per GN step.
+
+**Step 3 — why we don't build `Θ_train` directly.** Across GN steps
+the weights `c(x)` change, so every entry of `Θ_train` changes. We'd
+be building a fresh `(N_bdy + N_int)²` sparse Cholesky at every step.
+
+But notice: each training measurement is a *linear combination of a
+few fixed ones*. Concretely
+
+    (−Δ + c·δ) u  =  (−1) · (Δu)  +  c · (δu),
+
+so on the interior row-block,
+
+    K(train, train)_int,int
+      = K(−Δ + c·δ, −Δ + c·δ)_int
+      = K(Δ, Δ) − c · K(δ, Δ) − c · K(Δ, δ) + c · cᵀ · K(δ, δ),
+
+and the bdy-int cross block is similarly a linear combination of
+`K(δ, δ)` and `K(δ, Δ)`. All of these sub-blocks live inside **one
+bigger kernel matrix** whose measurements do *not* depend on `c(x)`:
+
+> **`Θ_big` = K over the fixed 3-set measurement list
+> `{ δ_bdy, δ_int, Δ_int }`** — size `(N_bdy + 2·N_int)²`.
+
+**Step 4 — the lift / apply / extract trick.** Because `Θ_train · v`
+is a linear combination of blocks of `Θ_big`, we compute it without
+ever materializing `Θ_train`:
+
+1. **lift** `v ∈ ℝ^{N_bdy + N_int}` to
+   `v_lift ∈ ℝ^{N_bdy + 2·N_int}` by copying `v_bdy` and, at the
+   interior, placing `c(xⱼⁱ) · v_int(j)` in the δ-block and
+   `−1 · v_int(j)` in the Δ-block;
+2. **apply** `Θ_big` to `v_lift` via the sparse factor of `Θ_big`
    (two triangular solves);
-3. **extract** the same-sized block back out.
+3. **extract** the `train`-row entries (boundary δ output + the
+   same weighted linear combination in the interior) back to
+   `ℝ^{N_bdy + N_int}`.
 
-`LiftedThetaTrainMatVec` does this. The expensive `Θ_big` factor is
-built **once outside the GN loop** and reused; only a cheap 2-set
-`Θ_train` factor gets rebuilt each GN step to serve as the pCG
-preconditioner.
+That's `LiftedThetaTrainMatVec` — the forward operator fed to
+`scipy.sparse.linalg.cg`. The **expensive `Θ_big` sparse factor is
+built only once**, outside the GN loop; what changes from step to step
+is the cheap lift / extract weights.
+
+**The small preconditioner.** pCG also wants a cheap approximation to
+`Θ_train⁻¹`. We get one by building a smaller, 2-set sparse Cholesky
+factor over just `{ δ_bdy, (−Δ + c·δ)_int }` — same size as
+`Θ_train` itself — at the current `c(x)`. This does get rebuilt each
+GN step, but it's much cheaper (one small factor, one-shot) and gives
+a strong preconditioner; pCG converges in ~10 iterations.
+
+**Summary.**
+
+| matrix     | size                      | what it is                                                                                 | what it costs                                                                           |
+| ---------- | ------------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `Θ_train`  | `(N_bdy + N_int)²`        | kernel of the *linearized* PDE training measurements at the current GN iterate `v`.         | 2-set sparse factor, **rebuilt cheaply each GN step** as the pCG preconditioner.        |
+| `Θ_big`    | `(N_bdy + 2·N_int)²`      | kernel over the *fixed union* of measurement types: boundary δ, interior δ, interior Δ.     | 3-set sparse factor, **built ONCE outside the GN loop**, reused as fast `Θ_train` matvec. |
+
+The same pattern generalizes: `VarLinElliptic2d` has a `Δ∇δ`
+measurement so its `Θ_big` has blocks `{δ_bdy, δ_int, (−a∆ − ∇a·∇)_int}`;
+`MongeAmpere2d` needs `∂∂` blocks; etc. Every `kolesky.pde` solver
+follows this lift → apply → extract pattern.
 
 ### Ordering multi-set measurements
 
