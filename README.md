@@ -169,6 +169,28 @@ The quickstart had four parameters that quietly do all the work:
   or `1e-4` when you don't. Bigger nugget ⇒ more stable, less
   accurate.
 
+### A note on kernel smoothness
+
+The sparsity of `U` depends on how fast the kernel's screened inverse
+decays — smoother kernels (e.g. Gaussian, Matérn with large ν) leave
+*long-range* entries in `U` that the maximin truncation has to keep if
+you want accuracy. Concretely, smoother ⇒ needs larger `ρ` at a given
+target error, and storage / cost scale like `O(N · ρᵈ)`.
+
+**Rule of thumb.**
+
+- **Matérn 5/2, 7/2** work very well here — they're the defaults in
+  every example.
+- **Matérn 9/2, 11/2, Gaussian** — usable but expect to push `ρ` up
+  before you're happy with the error; in high `d` this can be
+  expensive.
+- If you genuinely need a very smooth kernel: the kernel matrix in
+  that regime is often numerically *low-rank*, so a low-rank
+  approximation (Nyström, pivoted Cholesky) can be more efficient than
+  a sparse KL factor. For high-dimensional data we recommend
+  [eepperly/Randomly-Pivoted-Cholesky](https://github.com/eepperly/Randomly-Pivoted-Cholesky),
+  which is robust and parameter-light.
+
 ### Derivative measurements (beyond point values)
 
 Everything works for **any** linear functional of the GP, not just
