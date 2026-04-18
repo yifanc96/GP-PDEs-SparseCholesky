@@ -14,7 +14,7 @@ Two pieces, same repo:
    point clouds in any dimension, using the Kullback–Leibler
    minimization and maximin ordering in
    [Schäfer, Katzfuss, Owhadi 2020](https://arxiv.org/abs/2004.14455).
-2. **`kolesky.pde`** — a GP-regression PDE solver that uses the factor in the case of PDE measurements at point clouds
+2. **`kolesky.pde`** — a GP-regression PDE solver that obtains the factor in the case of PDE measurements at point clouds
    as a fast matvec *and* a preconditioner, following
    [Chen, Owhadi, Schäfer 2025](https://arxiv.org/abs/2304.01294).
 
