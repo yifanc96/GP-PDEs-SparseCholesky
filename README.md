@@ -132,13 +132,16 @@ The quickstart had four parameters that quietly do all the work:
   Matern 5/2). Every additional unit of ρ trades a factor of `~ρᵈ`
   more nnz for roughly an order of magnitude in accuracy.
 
-- **`k_neighbors`** — *supernodal grouping knob.* Columns whose
-  sparsity patterns are nearly identical get batched into one
-  supernode so their Cholesky factorizations share work. `k_neighbors`
-  controls how aggressively this happens — higher values merge more
-  columns per supernode (faster total, slightly denser factor).
-  `k_neighbors = 1` means no merging; `k = 3` is the usual default for
-  PDE problems. Affects speed, not correctness.
+- **`k_neighbors`** — *variant of the maximin ordering.* In standard
+  1-maximin (`k_neighbors = 1`, the default when unspecified), the
+  next point picked is the one whose **nearest** already-processed
+  point is farthest. With `k_neighbors = k > 1` ("k-maximin"), the
+  next point is instead the one whose **k-th nearest** already-
+  processed point is farthest. The resulting length scales `ell[i]`
+  are larger (k-th nearest ≥ 1st nearest), which enlarges every
+  column's sparsity neighborhood (`within ρ · ell[i]`) — so more nnz
+  and better accuracy, at extra cost. `k = 3` is the usual default
+  for PDE problems; `k = 1` is fine for a plain point cloud.
 
 - **`nugget`** — *diagonal regularization.* A small `nugget · I` is
   added to each local kernel block before the Cholesky. Covariance
