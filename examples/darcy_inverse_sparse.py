@@ -281,6 +281,60 @@ def _gn_hess_matvec(q, z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
     return out
 
 
+def _build_sparse_hessian(z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
+    """Assemble the GN Hessian (linearized v3 at z) as an explicit sparse
+    matrix:  H = 2 J_vᵀ (UTU_u) J_v + 2 J_wᵀ (UTU_w) J_w + (2/σ²) Eᵀ E.
+
+    The Jacobians J_v, J_w are highly sparse (each row has ≤ 5 nonzeros);
+    UTU_u and UTU_w are O(N · ρ²ᵈ) sparse. The product is sparse with
+    O(N · ρ²ᵈ) nonzeros — small enough for a direct sparse solve.
+    """
+    c_w0, c_w1, c_w2, c_v1, c_v2 = _coefs(z, rhs_f, N)
+
+    # ----- J_v : (Nb + 4N) × 6N  -----
+    rows = []; cols = []; data = []
+    j = np.arange(N)
+    # v0 rows: identity onto z[3N : 4N]
+    rows.append(Nb + j);          cols.append(3*N + j);     data.append(np.ones(N))
+    # v1 rows
+    rows.append(Nb +   N + j);    cols.append(4*N + j);     data.append(np.ones(N))
+    # v2 rows
+    rows.append(Nb + 2*N + j);    cols.append(5*N + j);     data.append(np.ones(N))
+    # v3_lin rows (5 nonzeros per row)
+    base = Nb + 3*N
+    for w_block, c_arr in (
+        (0,    c_w0), (N,    c_w1), (2*N,  c_w2),
+        (4*N,  c_v1), (5*N,  c_v2),
+    ):
+        rows.append(base + j); cols.append(w_block + j); data.append(c_arr)
+    rows = np.concatenate(rows); cols = np.concatenate(cols); data = np.concatenate(data)
+    J_v = scipy.sparse.coo_matrix((data, (rows, cols)),
+                                   shape=(Nb + 4*N, 6*N)).tocsr()
+
+    # M_u = J_v[P_u, :] (rows permuted to UTU_u's order).
+    M_u = J_v[sf_u.P, :].tocsr()
+    H_u = (M_u.T @ sf_u.UTU_csr @ M_u).tocsc()
+
+    # ----- J_w : (1 + 3N) × 6N  -----
+    rows = []; cols = []
+    rows.append(1     + j); cols.append(j)
+    rows.append(1 + N + j); cols.append(N + j)
+    rows.append(1 + 2*N + j); cols.append(2*N + j)
+    rows = np.concatenate(rows); cols = np.concatenate(cols)
+    data = np.ones(rows.size)
+    J_w = scipy.sparse.coo_matrix((data, (rows, cols)),
+                                   shape=(1 + 3*N, 6*N)).tocsr()
+    M_w = J_w[sf_w.P, :].tocsr()
+    H_w = (M_w.T @ sf_w.UTU_csr @ M_w).tocsc()
+
+    H = 2.0 * H_u + 2.0 * H_w
+    # data fidelity:  (2/σ²) on the v0[:N_data] diagonal
+    data_diag = np.zeros(6 * N)
+    data_diag[3*N : 3*N + N_data] = 2.0 / (sigma * sigma)
+    H = H + scipy.sparse.diags(data_diag).tocsc()
+    return H.tocsr()
+
+
 def _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, N_data, sigma):
     """Diagonal of the GN Hessian (Jacobi preconditioner)."""
     # diag(UᵀU)_ii  =  ‖U[:, i]‖² — column-norm-squared of the noiseless KL
@@ -434,25 +488,19 @@ def main(argv=None):
     print(f'         iter  0:  loss = {_loss_value(z):.4e}')
     t_loop = time.perf_counter()
     for step in range(1, args.GN_steps + 1):
-        g = _full_grad(z, sf_u, sf_w, rhs_f, bdy_g, data_noisy, N, Nb, Nd, sigma)
-        H_op = spla.LinearOperator(
-            (6*N, 6*N),
-            matvec=lambda q: _gn_hess_matvec(q, z, sf_u, sf_w, rhs_f, N, Nb, Nd, sigma),
-            dtype=np.float64,
-        )
-        diag_inv = _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, Nd, sigma)
-        M_op = spla.LinearOperator(
-            (6*N, 6*N), matvec=lambda q: diag_inv * q, dtype=np.float64,
-        )
-        it = [0]
         t0 = time.perf_counter()
-        delta, info = spla.cg(H_op, g, M=M_op, rtol=args.pcg_rtol,
-                                maxiter=args.pcg_maxiter,
-                                callback=lambda _x: it.__setitem__(0, it[0]+1))
+        g = _full_grad(z, sf_u, sf_w, rhs_f, bdy_g, data_noisy, N, Nb, Nd, sigma)
+        # Assemble the GN Hessian as a sparse matrix and direct-solve it.
+        # nnz(H) = O(N · ρ²ᵈ); spsolve handles 6N ~ 15 000 × 15 000 fine.
+        H = _build_sparse_hessian(z, sf_u, sf_w, rhs_f, N, Nb, Nd, sigma)
+        # Stabilize: tiny diagonal regularization (~ trace / N · 1e-10).
+        H = H + scipy.sparse.diags(np.full(6*N, 1e-10 * np.abs(H.diagonal()).mean()))
+        delta = spla.spsolve(H.tocsc(), g)
         z = z - delta
         loss_now = _loss_value(z)
         print(f'         iter {step:2d}:  loss = {loss_now:.4e}    '
-              f'pCG: {it[0]:>3d} iters, {time.perf_counter()-t0:.2f} s')
+              f'sparse_solve: nnz(H) = {H.nnz:,}, '
+              f'{time.perf_counter()-t0:.2f} s')
     print(f'[GN]     wall: {time.perf_counter()-t_loop:.2f} s')
 
     # ----- predict on test grid (dense kernel evaluation) -----
