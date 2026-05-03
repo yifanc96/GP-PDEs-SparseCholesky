@@ -235,6 +235,46 @@ for tight solves at small `σ²`, use `solve_Sigma` (CG with the ichol
 factor as preconditioner) — that's the use the paper actually
 recommends.
 
+#### Worked example: Darcy inverse problem
+
+`examples/darcy_inverse.py` is a self-contained PDE-inverse demo in
+which the noisy-regression setup falls out naturally. Forward PDE:
+`−∇·(a(x) ∇u(x)) = f(x)` on `[0,1]²` with `u = 0` on `∂Ω`. Inverse:
+given `N_data` noisy observations `data_i = u(x_i) + ηᵢ` with
+`ηᵢ ~ N(0, σ²)`, recover both `u(·)` and `a(·)` jointly.
+
+Place independent GP priors on `u` and `w := log a`, then minimize
+
+    ‖u‖²_{H_u}  +  ‖w‖²_{H_w}  +  (1/σ²) Σᵢ |u(xᵢ) − dataᵢ|²
+
+subject to the PDE constraint. The Gauss-Newton Hessian has exactly
+the additive-noise structure `(Theta_u⁻¹ + (1/σ²) EᵀE)` from
+Algorithm 4.1 — `EᵀE` is the diagonal selector picking out the
+`N_data` observation rows. The demo uses dense Cholesky for clarity
+(`N_domain ≈ 200`); for larger `N` you would build a sparse `kolesky`
+factor of `Theta_u` and feed it into `NoisyExplicitKLFactorization` to
+solve the GN linear system at `O(N · ρ²ᵈ)`.
+
+```bash
+python examples/darcy_inverse.py --N-domain 200 --N-data 60 --noise 1e-3
+```
+
+![Darcy inverse](docs/darcy_inverse.png)
+
+Output at `N_dom = 200, N_data = 60, σ_noise = 1e-3`, Gaussian kernel
+at length scale 0.2, 6 GN steps:
+
+```
+[error]  L²(u)         = 6.6e-4   (rel  4.8%)
+[error]  L²(a-recover) = 9.0e-1   (rel 25.6%)
+```
+
+The recovered `a(x)` (top-right) reproduces the qualitative
+two-bump structure of the truth (top-left); `u(x)` is recovered to
+~5%. Black dots on the lower-right panel are the observation
+locations. Recovery quality on `a` improves with more data (`N_data`)
+and a tighter `σ_noise`.
+
 ### Derivative measurements (beyond point values)
 
 Everything works for **any** linear functional of the GP, not just
