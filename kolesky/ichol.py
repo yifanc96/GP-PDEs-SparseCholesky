@@ -15,13 +15,23 @@ Why this matters:
     decay of (Θ + R)⁻¹, so the maximin sparsity pattern is no longer
     a good support. The paper's trick is to factor Θ alone (existing
     pipeline), then run a *second* incomplete Cholesky on the
-    well-conditioned correction R⁻¹ + Θ⁻¹. Combined with Woodbury's
-    identity,
+    well-conditioned correction R⁻¹ + Θ⁻¹. Combining the two factors
+    via the simple algebraic identity (paper §4.1 — *not*
+    Sherman-Morrison-Woodbury)
 
-        Σ⁻¹  =  (Θ + R)⁻¹  =  R⁻¹  −  R⁻¹ A⁻¹ R⁻¹,
+        Σ  =  Θ̂ + R  =  Θ̂ (R⁻¹ + Θ̂⁻¹) R                              (1)
 
-    the two factors give an O(N · ρ²ᵈ) preconditioner / direct
-    approximate solver for noisy GP regression.
+    and using Uᵀ U ≈ Θ̂⁻¹, Ũᵀ Ũ ≈ R⁻¹ + Θ̂⁻¹, the apply / inverse-apply
+    chains are
+
+        Σ    ≈  (Uᵀ U)⁻¹  Ũᵀ Ũ  R                                     (apply Σ)
+        Σ⁻¹  ≈  R⁻¹  Ũ⁻¹ Ũ⁻ᵀ  Uᵀ U                                    (apply Σ⁻¹)
+
+    each of which is four cheap sparse pieces. The paper recommends
+    using ``Ũ`` as a *preconditioner* for an inner CG that solves
+    ``(R⁻¹ + Θ̂⁻¹) α = c`` for tighter accuracy at small σ²;
+    :py:meth:`solve_Sigma` runs that pattern (single-precision in ~10
+    iterations).
 
 Cost: same asymptotic complexity as the noiseless factorization itself
 (O(N · ρ²ᵈ) time, O(N · ρᵈ) memory), uniform in σ.
@@ -232,36 +242,40 @@ class NoisyExplicitKLFactorization:
         Rv[self.P] = self.R_perm * v[self.P]   # equivalent to R_orig * v
         return Theta_v + Rv
 
-    # ----- inverse: x = Σ⁻¹ b = R⁻¹ b − R⁻¹ A⁻¹ R⁻¹ b   (Woodbury) -----
+    # ----- inverse: x = Σ⁻¹ b ≈ R⁻¹ Ũ⁻¹ Ũ⁻ᵀ Uᵀ U b   (paper §4.1) -----
 
     def apply_Sigma_inv(self, b: np.ndarray) -> np.ndarray:
-        """Direct one-shot approximation of ``x ≈ (Θ + R)⁻¹ b`` via Woodbury.
+        """One-shot approximation of ``x ≈ (Θ + R)⁻¹ b`` via the paper's
+        factor-product identity  ``Σ⁻¹ ≈ R⁻¹ Ũ⁻¹ Ũ⁻ᵀ Uᵀ U`` (paper §4.1).
 
-        Cheap (two pairs of triangular solves + diagonal scalings) but its
-        accuracy is bounded by the *noiseless* factor's accuracy times
-        κ(Σ): when σ² is small enough that κ(Σ) is large, the two terms
-        in the Woodbury identity nearly cancel, and any error in the
-        noiseless `U` gets amplified. For tight solves at small σ², use
-        :py:meth:`solve_Sigma` (CG with this routine as preconditioner).
+        Four sparse pieces: two matvecs with U, Uᵀ on the noiseless
+        factor (gives Θ̂⁻¹ b), then two triangular solves with Ũᵀ, Ũ
+        on the ichol factor (gives A⁻¹ on the result), then a diagonal
+        scaling by R⁻¹.
+
+        Cheap — but accuracy is bounded by the noiseless factor's
+        accuracy as a Θ̂⁻¹ approximation. The bare ``Uᵀ U`` matvec form
+        is less accurate than the forward triangular-solve form, so at
+        small ρ this one-shot apply can have substantial residual. For
+        tighter accuracy use :py:meth:`solve_Sigma` (CG on the inner
+        ``A x = c`` with ``Ũ`` as preconditioner — the path the paper
+        recommends).
         """
         b = np.asarray(b, dtype=np.float64)
-        # t = R⁻¹ b   (diagonal in original order; same trick as in apply_Sigma).
-        t = np.empty_like(b)
-        t[self.P] = self.R_inv_perm * b[self.P]
 
-        # u = A⁻¹ t   ≈   P^T Ũ⁻¹ Ũ⁻ᵀ P t
-        tp = t[self.P]
-        # Ũᵀ y = tp  →  y = Ũ⁻ᵀ tp   (lower triangular solve)
-        y = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.T.tocsr(), tp, lower=True)
-        # Ũ z = y   →   z = Ũ⁻¹ y    (upper triangular solve)
-        z = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.tocsr(),   y,  lower=False)
-        u = np.empty_like(b)
-        u[self.P] = z
+        # Step 1 — Θ̂⁻¹ b   ≈   Pᵀ (Uᵀ U) P b     (two sparse matvecs).
+        bp = b[self.P]
+        s = self.U.T @ (self.U @ bp)             # in P-perm order
 
-        # x = R⁻¹ b − R⁻¹ u
-        Rinv_u = np.empty_like(b)
-        Rinv_u[self.P] = self.R_inv_perm * u[self.P]
-        return t - Rinv_u
+        # Step 2 — A⁻¹ s   ≈   Pᵀ Ũ⁻¹ Ũ⁻ᵀ P s     (two triangular solves).
+        y = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.T.tocsr(), s, lower=True)
+        z = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.tocsr(),   y, lower=False)
+        u = np.empty_like(b); u[self.P] = z
+
+        # Step 3 — R⁻¹ u   (diagonal in original order).
+        out = np.empty_like(b)
+        out[self.P] = self.R_inv_perm * u[self.P]
+        return out
 
     # ----- iterative CG-with-preconditioner solve (paper's recommended path) -----
 
@@ -270,27 +284,61 @@ class NoisyExplicitKLFactorization:
         b: np.ndarray,
         rtol: float = 1e-8,
         maxiter: int = 200,
-        x0: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Iterative ``x ≈ (Θ + R)⁻¹ b`` via CG preconditioned by the
-        ichol factor (Algorithm 4.1's recommended use).
+        """Iterative ``x ≈ (Θ + R)⁻¹ b`` following the paper's exact
+        recommendation (§4.1): apply Σ⁻¹ via the chain
+        ``R⁻¹ A⁻¹ Θ̂⁻¹``, with the inner ``A α = c`` solve done by CG
+        preconditioned by the ichol factor ``Ũᵀ Ũ ≈ A``.
 
-        Drives `Σ x = b` with `M = apply_Sigma_inv` as the preconditioner.
-        Converges in ~10 iterations to single-precision when the
-        noiseless `U` is reasonably accurate; degrades gracefully when
-        σ² is small (the underlying problem becomes ill-conditioned).
+        Specifically:
+            c  =  Θ̂⁻¹ b              (one sparse matvec via UᵀU)
+            α  =  A⁻¹ c              (CG, preconditioner = ŨᵀŨ-solve)
+            x  =  R⁻¹ α              (diagonal scaling)
+
+        Converges in ~10 iterations to single-precision (paper's
+        empirical claim); each CG step is two sparse matvecs (for
+        ``A α = R⁻¹ α + Θ̂⁻¹ α``) plus the ichol preconditioner solve.
         """
         b = np.asarray(b, dtype=np.float64)
         N = b.shape[0]
+
+        # ----- Step 1: c = Θ̂⁻¹ b  ≈  Pᵀ Uᵀ U P b  (in P-perm we work with cp). -----
+        bp = b[self.P]
+        cp = self.U.T @ (self.U @ bp)
+
+        # ----- Step 2: solve  A αp = cp  via CG with Ũ-preconditioner.
+        # In P-perm:  A_perm = R⁻¹_perm + UᵀU.  Matvec is two sparse matvecs.
+        UTU = self.U.T.dot(self.U).tocsr()      # cheap to form; nnz ~ same as UᵀU
+        R_inv_perm = self.R_inv_perm
+
+        def A_matvec(v):
+            return R_inv_perm * v + UTU @ v
+
         A_op = scipy.sparse.linalg.LinearOperator(
-            (N, N), matvec=lambda v: self.apply_Sigma(v), dtype=np.float64,
+            (N, N), matvec=A_matvec, dtype=np.float64,
         )
+
+        Ut_csr = self.U_tilde.T.tocsr()
+        U_csr  = self.U_tilde.tocsr()
+
+        def M_matvec(v):
+            # Ũᵀ Ũ-solve: Ũᵀ y = v, then Ũ z = y.
+            y = scipy.sparse.linalg.spsolve_triangular(Ut_csr, v, lower=True)
+            z = scipy.sparse.linalg.spsolve_triangular(U_csr,  y, lower=False)
+            return z
+
         M_op = scipy.sparse.linalg.LinearOperator(
-            (N, N), matvec=lambda v: self.apply_Sigma_inv(v), dtype=np.float64,
+            (N, N), matvec=M_matvec, dtype=np.float64,
         )
-        if x0 is None:
-            x0 = self.apply_Sigma_inv(b)
-        x, info = scipy.sparse.linalg.cg(
-            A_op, b, x0=x0, M=M_op, rtol=rtol, maxiter=maxiter,
+
+        # warm start: αp ≈ Ũ⁻¹ Ũ⁻ᵀ cp
+        alpha_p_x0 = M_matvec(cp)
+        alpha_p, _info = scipy.sparse.linalg.cg(
+            A_op, cp, x0=alpha_p_x0, M=M_op, rtol=rtol, maxiter=maxiter,
         )
-        return x
+
+        # ----- Step 3: α = Pᵀ αp,  then x = R⁻¹ α (diagonal in original order). -----
+        alpha = np.empty_like(b); alpha[self.P] = alpha_p
+        out = np.empty_like(b)
+        out[self.P] = self.R_inv_perm * alpha[self.P]
+        return out

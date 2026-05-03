@@ -199,13 +199,20 @@ the noiseless KL factorization on `Σ` *fails*: adding `σ²` to every
 diagonal of `Θ` flattens the off-diagonal decay of `Σ⁻¹`, and the
 maximin sparsity pattern is no longer accurate. **Algorithm 4.1** of
 Schäfer-Katzfuss-Owhadi handles this in two stages: factor `Θ` first
-(noiseless, as above), then run a *second* incomplete Cholesky on the
-better-behaved correction `R⁻¹ + Θ⁻¹`. Combined with Woodbury,
+(noiseless), then run a *second* incomplete Cholesky on the
+better-behaved correction `R⁻¹ + Θ⁻¹`. The paper combines the two
+factors via the simple algebraic identity (no Sherman-Morrison-Woodbury)
 
-    Σ⁻¹  =  R⁻¹  −  R⁻¹ (R⁻¹ + Θ⁻¹)⁻¹ R⁻¹,
+    Σ  =  Θ̂ + R  =  Θ̂ (R⁻¹ + Θ̂⁻¹) R,
 
-the two factors give an `O(N · ρ²ᵈ)` approximate solver / preconditioner
-for `Σ`, uniform in `σ`.
+so with `Uᵀ U ≈ Θ̂⁻¹` and `Ũᵀ Ũ ≈ R⁻¹ + Θ̂⁻¹`,
+
+    Σ⁻¹  ≈  R⁻¹  Ũ⁻¹ Ũ⁻ᵀ  Uᵀ U                                       (paper §4.1)
+
+— two sparse matvecs, two triangular solves, one diagonal scaling.
+Total `O(N · ρ²ᵈ)`, uniform in σ. For tighter accuracy at small σ²
+the paper recommends inner CG on `(R⁻¹ + Θ̂⁻¹) α = c` with `Ũ` as
+preconditioner (~10 iterations to single precision).
 
 ```python
 import kolesky as kl
