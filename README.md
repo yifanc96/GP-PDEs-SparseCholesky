@@ -191,6 +191,50 @@ target error, and storage / cost scale like `O(N · ρᵈ)`.
   [eepperly/Randomly-Pivoted-Cholesky](https://github.com/eepperly/Randomly-Pivoted-Cholesky),
   which is robust and parameter-light.
 
+### Noisy regression: `Σ = Θ + R` (Algorithm 4.1)
+
+For GP regression with additive observation noise — `Σ = Θ + R` for
+diagonal noise covariance `R = σ² I` (or per-point) — naively running
+the noiseless KL factorization on `Σ` *fails*: adding `σ²` to every
+diagonal of `Θ` flattens the off-diagonal decay of `Σ⁻¹`, and the
+maximin sparsity pattern is no longer accurate. **Algorithm 4.1** of
+Schäfer-Katzfuss-Owhadi handles this in two stages: factor `Θ` first
+(noiseless, as above), then run a *second* incomplete Cholesky on the
+better-behaved correction `R⁻¹ + Θ⁻¹`. Combined with Woodbury,
+
+    Σ⁻¹  =  R⁻¹  −  R⁻¹ (R⁻¹ + Θ⁻¹)⁻¹ R⁻¹,
+
+the two factors give an `O(N · ρ²ᵈ)` approximate solver / preconditioner
+for `Σ`, uniform in `σ`.
+
+```python
+import kolesky as kl
+
+# 1) noiseless factor (as before)
+implicit = kl.ImplicitKLFactorization.build(kernel, meas, rho=4, k_neighbors=3)
+explicit = kl.ExplicitKLFactorization(implicit, nugget=1e-10, backend='cpu')
+
+# 2) noisy variant: pass the explicit factor + the diagonal noise covariance
+noisy = kl.NoisyExplicitKLFactorization.build(explicit, R=sigma2)
+
+# 3) one-shot Woodbury (cheap, accuracy bounded by κ(Σ) × noiseless-error)
+x_approx = noisy.apply_Sigma_inv(b)
+
+# 4) tight solve via CG, with the ichol factor as preconditioner — the
+#    paper's recommended use; converges in tens of iterations
+x = noisy.solve_Sigma(b, rtol=1e-8, maxiter=100)
+```
+
+`R` may be a scalar σ² (homoscedastic) or a length-`N` array of
+per-point variances (heteroscedastic). `apply_Sigma(v) = (Θ + R) v` is
+also exposed.
+
+*Caveat.* The bare `apply_Sigma_inv` is a one-shot direct approximation
+and works best at moderate noise (`σ²` such that `κ(Σ)` stays modest);
+for tight solves at small `σ²`, use `solve_Sigma` (CG with the ichol
+factor as preconditioner) — that's the use the paper actually
+recommends.
+
 ### Derivative measurements (beyond point values)
 
 Everything works for **any** linear functional of the GP, not just

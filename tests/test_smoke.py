@@ -49,6 +49,46 @@ def _sample_cube_grid_3d(h_in=0.2, h_bd=0.2):
     return X_dom, faces[np.sort(uniq)]
 
 
+def test_noisy_ichol_factorization():
+    """Algorithm 4.1: Σ = Θ + σ²I via noiseless KL + ichol + Woodbury / pCG.
+
+    The bare Woodbury solve is accuracy-limited by the noiseless U at
+    small σ²; the CG-with-precond path is what the paper recommends.
+    Test both at moderate σ² where they're well-conditioned.
+    """
+    rng = np.random.default_rng(0)
+    N = 200
+    pts = rng.uniform(0, 1, (N, 2))
+    m = kl.point_measurements(pts, dims=2)
+    kernel = kl.MaternCovariance5_2(0.2)
+
+    implicit = kl.ImplicitKLFactorization.build(kernel, m, rho=4.0, k_neighbors=3)
+    explicit = kl.ExplicitKLFactorization(implicit, nugget=0.0, backend='cpu')
+
+    K = kernel(m).astype(np.float64)
+    sigma2 = 1.0
+    Sigma = K + sigma2 * np.eye(N)
+    b = rng.standard_normal(N)
+    x_exact = np.linalg.solve(Sigma, b)
+
+    noisy = kl.NoisyExplicitKLFactorization.build(explicit, R=sigma2)
+
+    # Sanity: ichol's Ũ has the same sparsity pattern as the noiseless U.
+    assert noisy.U_tilde.nnz == explicit.U.nnz
+    assert noisy.U_tilde.shape == explicit.U.shape
+
+    # forward apply: Σ v = Θ v + R v
+    v = rng.standard_normal(N)
+    y_approx = noisy.apply_Sigma(v)
+    err_apply = np.linalg.norm(y_approx - Sigma @ v) / np.linalg.norm(Sigma @ v)
+    assert err_apply < 1e-2, f'apply_Sigma rel err = {err_apply}'
+
+    # iterative pCG converges; with σ²=1 and ρ=4 we get ~10⁻³ in <100 iters.
+    x_cg = noisy.solve_Sigma(b, rtol=1e-8, maxiter=200)
+    err_cg = np.linalg.norm(x_cg - x_exact) / np.linalg.norm(x_exact)
+    assert err_cg < 5e-3, f'solve_Sigma rel err = {err_cg}'
+
+
 def test_kolesky_factorization_roundtrip():
     """Sanity-check the sparse Cholesky factor: valid sparsity pattern,
     positive diagonal, approximates K well when we only check K @ b against

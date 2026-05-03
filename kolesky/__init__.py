@@ -58,6 +58,10 @@ from .factorization import (
     ExplicitKLFactorization,
     assemble_covariance,
 )
+from .ichol import (
+    NoisyExplicitKLFactorization,
+    ichol_pattern,
+)
 
 __version__ = "0.1.0"
 
@@ -91,4 +95,7 @@ __all__ = [
     "ImplicitKLFactorization",
     "ExplicitKLFactorization",
     "assemble_covariance",
+    # noisy / Algorithm 4.1
+    "NoisyExplicitKLFactorization",
+    "ichol_pattern",
 ]
