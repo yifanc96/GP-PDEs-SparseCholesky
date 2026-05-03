@@ -217,23 +217,28 @@ def _unpack_w_grad(y_w, N):
 
 
 class _SparseFactorInv:
-    __slots__ = ('UTU_csr', 'P')
+    """Matvec form of Θ⁻¹ via the kolesky upper-triangular factor U.
+    Convention check: kolesky's U is upper-triangular with
+    ``U⁻ᵀ U⁻¹ = K_perm`` (forward apply via two triangular solves), so
+    ``K_perm⁻¹ = U Uᵀ`` (verified numerically to machine precision at
+    full rho). The matvec order for Θ⁻¹·v is therefore U @ (Uᵀ @ vp),
+    NOT Uᵀ @ (U @ vp).
+    """
+    __slots__ = ('UUT_csr', 'P', 'U_csr', 'UT_csr')
 
     def __init__(self, explicit):
-        # Precompute UᵀU once. nnz(UᵀU) ≤ symbolic UᵀU pattern,
-        # = O(N · ρ²ᵈ) — same asymptotic as the factor itself.
-        UTU = (explicit.U.T @ explicit.U).tocsr()
-        UTU.sort_indices()
-        self.UTU_csr = UTU
+        # Precompute U Uᵀ once. nnz ~ O(N · ρ²ᵈ).
+        self.U_csr  = explicit.U.tocsr()
+        self.UT_csr = explicit.U.T.tocsr()
+        UUT = (explicit.U @ explicit.U.T).tocsr()
+        UUT.sort_indices()
+        self.UUT_csr = UUT
         self.P = np.asarray(explicit.P, dtype=np.int64)
 
     def apply(self, v: np.ndarray) -> np.ndarray:
-        """Apply ``Pᵀ (UᵀU) P v`` — the sparse factor's matvec form, equal
-        to applying Theta_approx⁻¹ on v. One sparse matvec + two
-        permutations. NO inverse approximation issue: this *is* the
-        defining sparse primitive that the GN loss inner-product uses."""
+        """Apply Θ⁻¹ ≈ P U Uᵀ Pᵀ to v via two sparse matvecs."""
         vp = v[self.P]
-        z = self.UTU_csr @ vp
+        z = self.U_csr @ (self.UT_csr @ vp)
         out = np.empty_like(v); out[self.P] = z
         return out
 
@@ -311,9 +316,9 @@ def _build_sparse_hessian(z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
     J_v = scipy.sparse.coo_matrix((data, (rows, cols)),
                                    shape=(Nb + 4*N, 6*N)).tocsr()
 
-    # M_u = J_v[P_u, :] (rows permuted to UTU_u's order).
+    # M_u = J_v[P_u, :] (rows permuted to UUᵀ_u's order).
     M_u = J_v[sf_u.P, :].tocsr()
-    H_u = (M_u.T @ sf_u.UTU_csr @ M_u).tocsc()
+    H_u = (M_u.T @ sf_u.UUT_csr @ M_u).tocsc()
 
     # ----- J_w : (1 + 3N) × 6N  -----
     rows = []; cols = []
@@ -325,7 +330,7 @@ def _build_sparse_hessian(z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
     J_w = scipy.sparse.coo_matrix((data, (rows, cols)),
                                    shape=(1 + 3*N, 6*N)).tocsr()
     M_w = J_w[sf_w.P, :].tocsr()
-    H_w = (M_w.T @ sf_w.UTU_csr @ M_w).tocsc()
+    H_w = (M_w.T @ sf_w.UUT_csr @ M_w).tocsc()
 
     H = 2.0 * H_u + 2.0 * H_w
     # data fidelity:  (2/σ²) on the v0[:N_data] diagonal
@@ -337,9 +342,8 @@ def _build_sparse_hessian(z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
 
 def _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, N_data, sigma):
     """Diagonal of the GN Hessian (Jacobi preconditioner)."""
-    # diag(UᵀU)_ii  =  ‖U[:, i]‖² — column-norm-squared of the noiseless KL
-    # factor; we read it back into the natural order via the inverse perm.
-    diag_u_perm = np.asarray(sf_u.UTU_csr.diagonal()).ravel()
+    # diag(U Uᵀ)_ii  = ‖U[i, :]‖² — row-norm-squared of the kolesky factor.
+    diag_u_perm = np.asarray(sf_u.UUT_csr.diagonal()).ravel()
     P_u_inv = np.empty_like(sf_u.P); P_u_inv[sf_u.P] = np.arange(sf_u.P.size)
     diag_u_natural = diag_u_perm[P_u_inv]
     dv0 = diag_u_natural[Nb     : Nb +   N]
@@ -347,7 +351,7 @@ def _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, N_data, sigma):
     dv2 = diag_u_natural[Nb + 2*N : Nb + 3 * N]
     dv3 = diag_u_natural[Nb + 3*N : Nb + 4 * N]
 
-    diag_w_perm = np.asarray(sf_w.UTU_csr.diagonal()).ravel()
+    diag_w_perm = np.asarray(sf_w.UUT_csr.diagonal()).ravel()
     P_w_inv = np.empty_like(sf_w.P); P_w_inv[sf_w.P] = np.arange(sf_w.P.size)
     diag_w_natural = diag_w_perm[P_w_inv]
     dw0 = diag_w_natural[1            : 1 +   N]
@@ -477,12 +481,11 @@ def main(argv=None):
         v3 = _v3_nonlinear(z_, rhs_f, N)
         v_all = _pack_v_all(z_, v3, bdy_g, N, Nb)
         w_all = _pack_w_all(z_, N)
-        # Sparse-factor "L⁻¹ x" version: the loss term v_all · Theta_u⁻¹ · v_all
-        # equals v_all · (Pᵀ UᵀU P) · v_all = ‖U Pv_all‖².
-        Lu_v = expl_u.U @ v_all[expl_u.P]
-        Lw_w = expl_w.U @ w_all[expl_w.P]
+        # Sparse-factor identity: K_perm⁻¹ = U Uᵀ, so v · K⁻¹ · v = ‖Uᵀ v‖².
+        UTv_u = expl_u.U.T @ v_all[expl_u.P]
+        UTv_w = expl_w.U.T @ w_all[expl_w.P]
         v0 = z_[3*N:4*N]
-        return (Lu_v @ Lu_v + Lw_w @ Lw_w
+        return (UTv_u @ UTv_u + UTv_w @ UTv_w
                 + (1.0/sigma**2) * np.sum((v0[:Nd] - data_noisy)**2))
 
     print(f'         iter  0:  loss = {_loss_value(z):.4e}')
@@ -515,34 +518,26 @@ def main(argv=None):
     w0 = z[0:N]; w1 = z[N:2*N]; w2 = z[2*N:3*N]
     v0 = z[3*N:4*N]; v1 = z[4*N:5*N]; v2 = z[5*N:6*N]
     v3 = -v1 * w1 - v2 * w2 - rhs_f * np.exp(-w0)
-    sol_u = np.concatenate([v1, v2, v3, v0, bdy_g])         # (4N+Nb,)
-    sol_w = np.concatenate([w1, w2, w0])                    # (3N,)
 
-    # Dense kernel(test, train) for the post-GN extension. Same as
-    # darcy_inverse.py's extend_sol — the price is one Nt × Ntrain dense
-    # evaluation outside the GN loop, which is fine.
+    # sol_u and sol_w in the *sparse* natural order (matches sf_u, sf_w):
+    sol_u = _pack_v_all(z, v3, bdy_g, N, Nb)         # [bdy_g, v0, v1, v2, v3]
+    sol_w = _pack_w_all(z, N)                         # [0_dummy, w0, w1, w2]
+
     from kolesky.measurements import (
         LaplaceGradDiracPointMeasurement, stack_measurements,
     )
     test_meas = _lgd(X_test, np.zeros(Nt), np.zeros((Nt, 2)), np.ones(Nt))
-    train_meas_u = stack_measurements([
-        _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N)),
-        _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N)),
-        _lgd(X_dom, np.ones(N),  np.zeros((N, 2)),            np.zeros(N)),
-        _lgd(X_dom, np.zeros(N), np.zeros((N, 2)),            np.ones(N)),
-        _lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)),          np.ones(Nb)),
-    ])
-    train_meas_w = stack_measurements([
-        _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N)),
-        _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N)),
-        _lgd(X_dom, np.zeros(N), np.zeros((N, 2)),            np.ones(N)),
-    ])
+    # Train measurements in *sparse natural order*: [δ_bdy, δ_int, ∂₁, ∂₂, Δ]
+    train_meas_u = stack_measurements(_theta_u_groups(X_dom, X_bdy))
+    # For w: same natural order [dummy_bdy, δ_int, ∂₁, ∂₂]
+    train_meas_w = stack_measurements(_theta_w_groups(X_dom))
+
     Theta_u_test = np.asarray(kernel(test_meas, train_meas_u), dtype=np.float64)
     Theta_w_test = np.asarray(kernel(test_meas, train_meas_w), dtype=np.float64)
 
-    # alpha_u = Theta_u⁻¹ sol_u  via sparse factor matvec.
+    # alpha = Theta⁻¹ sol  via the sparse-factor matvec (U Uᵀ form).
     alpha_u = sf_u.apply(sol_u)
-    alpha_w = sf_w.apply(np.concatenate([np.zeros(1), sol_w]))[1:]   # drop dummy bdy slot
+    alpha_w = sf_w.apply(sol_w)
 
     u_pred = Theta_u_test @ alpha_u
     w_pred = Theta_w_test @ alpha_w
