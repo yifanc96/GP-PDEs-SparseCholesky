@@ -82,9 +82,9 @@ def _col_inner_lt(U: scipy.sparse.csc_matrix, i: int, j: int, max_row: int) -> f
 def ichol_pattern(
     U: scipy.sparse.csc_matrix,
     R_inv_perm: np.ndarray,
+    use_squared_pattern: bool = True,
 ) -> scipy.sparse.csc_matrix:
-    """Algorithm 4.1: incomplete Cholesky of A = Uᵀ U + diag(R_inv_perm)
-    restricted to the sparsity pattern of `U`.
+    """Algorithm 4.1: incomplete Cholesky of  A = Uᵀ U + diag(R_inv_perm).
 
     Parameters
     ----------
@@ -92,38 +92,58 @@ def ichol_pattern(
         Noiseless KL factor (same convention as ``ExplicitKLFactorization.U``).
     R_inv_perm : array of shape (N,)
         Diagonal of R⁻¹ in the *P-permuted* order (i.e. ``R_orig_diag[P]``;
-        for homoscedastic σ², this is just ``np.full(N, 1/σ²)``).
+        for homoscedastic σ² this is just ``np.full(N, 1/σ²)``).
+    use_squared_pattern : bool, default True
+        If True (paper §4.1, line 579–589), compute the ichol on the
+        sparsity pattern of ``UᵀU`` (~2× denser than ``U``'s pattern but
+        "as accurate as the exact Cholesky of A over a wide range of ρ"
+        per the paper's experiments). If False, use the pattern of ``U``
+        (cheaper but lower accuracy at small ρ).
 
     Returns
     -------
     U_tilde : scipy.sparse.csc_matrix, upper-triangular
-        Sparse factor with the same pattern as ``U`` and ``Ũᵀ Ũ ≈ A`` on
-        that pattern. ``Ũᵢᵢ > 0`` by construction.
+        Sparse factor satisfying ``Ũᵀ Ũ ≈ A`` on the chosen pattern.
+        ``Ũᵢᵢ > 0`` by construction.
     """
     N = U.shape[0]
     R_inv_perm = np.asarray(R_inv_perm, dtype=np.float64)
     if R_inv_perm.shape != (N,):
         raise ValueError(f'R_inv_perm must have shape (N,) = ({N},), got {R_inv_perm.shape}')
 
-    # Step 1: assemble A on pattern(U) via UtU = U.T @ U.
-    # `U.T @ U` is denser than U, but cheap and lets us index into it cleanly.
-    UtU = (U.T @ U).tocsc()
+    # Step 1: assemble A on the chosen pattern.
+    UtU = (U.T @ U).tocsc()                      # exact UᵀU, denser than U
+    if use_squared_pattern:
+        # Take the upper triangle of UtU (same triangular convention as U).
+        # UᵀU's nonzero structure IS the "LL⊤ pattern" the paper recommends.
+        UtU_upper = scipy.sparse.triu(UtU, k=0).tocsc()
+        UtU_upper.eliminate_zeros()
+        UtU_upper.sort_indices()
+        out_indices = UtU_upper.indices.copy()
+        out_indptr  = UtU_upper.indptr.copy()
+        A_data = UtU_upper.data.copy()
+    else:
+        out_indices = U.indices.copy()
+        out_indptr  = U.indptr.copy()
+        A_data = np.empty(U.nnz, dtype=np.float64)
+        for j in range(N):
+            col_start = U.indptr[j]
+            col_end = U.indptr[j + 1]
+            rows = U.indices[col_start:col_end]
+            UtU_col = UtU.getcol(j).toarray().ravel()
+            A_data[col_start:col_end] = UtU_col[rows]
 
-    A_data = np.empty(U.nnz, dtype=np.float64)
+    # Add R⁻¹ to the diagonal: in CSC upper-triangular layout the diagonal
+    # of column j is the LAST entry of column j (rows ascending; max row = j).
     for j in range(N):
-        col_start = U.indptr[j]
-        col_end = U.indptr[j + 1]
-        rows = U.indices[col_start:col_end]
-        UtU_col = UtU.getcol(j).toarray().ravel()
-        A_data[col_start:col_end] = UtU_col[rows]
-        # Add R⁻¹ to diagonal: the last entry in column j is the (j, j) entry
-        # because U is upper-triangular and rows are ascending.
-        A_data[col_end - 1] += R_inv_perm[j]
+        col_end = out_indptr[j + 1]
+        # Defensive: confirm the last row index in this column is j.
+        # (For correctly-built U / UtU this always holds.)
+        if col_end > out_indptr[j] and out_indices[col_end - 1] == j:
+            A_data[col_end - 1] += R_inv_perm[j]
 
-    # Step 2: incomplete Cholesky on A, in-place (output has same pattern).
+    # Step 2: incomplete Cholesky on A, in-place (output keeps the pattern).
     out_data = A_data.copy()
-    out_indices = U.indices.copy()
-    out_indptr = U.indptr.copy()
     out = scipy.sparse.csc_matrix((out_data, out_indices, out_indptr), shape=(N, N))
 
     for j in range(N):
@@ -283,62 +303,57 @@ class NoisyExplicitKLFactorization:
         self,
         b: np.ndarray,
         rtol: float = 1e-8,
-        maxiter: int = 200,
+        maxiter: int = 100,
     ) -> np.ndarray:
-        """Iterative ``x ≈ (Θ + R)⁻¹ b`` following the paper's exact
-        recommendation (§4.1): apply Σ⁻¹ via the chain
-        ``R⁻¹ A⁻¹ Θ̂⁻¹``, with the inner ``A α = c`` solve done by CG
-        preconditioned by the ichol factor ``Ũᵀ Ũ ≈ A``.
+        """Iterative ``x ≈ (Θ + R)⁻¹ b`` following paper §4.1's
+        recommendation that "the accuracy for solving systems of
+        equations in Σ can easily be increased by adding a few
+        iterations of conjugate gradient" (paper line 770).
 
-        Specifically:
-            c  =  Θ̂⁻¹ b              (one sparse matvec via UᵀU)
-            α  =  A⁻¹ c              (CG, preconditioner = ŨᵀŨ-solve)
-            x  =  R⁻¹ α              (diagonal scaling)
+        Outer CG on the symmetric system ``Σ x = b``:
 
-        Converges in ~10 iterations to single-precision (paper's
-        empirical claim); each CG step is two sparse matvecs (for
-        ``A α = R⁻¹ α + Θ̂⁻¹ α``) plus the ichol preconditioner solve.
+          * **Matvec** ``Σ v  =  Θ v + R v`` — Θ via the noiseless KL
+            factor's *forward* apply (two triangular solves on U;
+            highly accurate), plus a diagonal R-scaling. This is what
+            `apply_Sigma` computes.
+          * **Preconditioner** ``M ≈ Σ⁻¹`` — the symmetric (Sherman-
+            Morrison) rearrangement of the paper's chain identity:
+
+                 M  =  R⁻¹  −  R⁻¹ A⁻¹ R⁻¹    (with A = R⁻¹ + Θ̂⁻¹)
+
+            which is mathematically the same matrix as the paper's
+            asymmetric chain ``R⁻¹ A⁻¹ Θ̂⁻¹`` (exact-arithmetic
+            equivalence) but in the symmetric form CG requires.
+            ``A⁻¹`` is applied via ``Ũ`` triangular solves.
+
+        Converges in ~10 iterations to single precision (paper's
+        empirical claim).
         """
         b = np.asarray(b, dtype=np.float64)
         N = b.shape[0]
 
-        # ----- Step 1: c = Θ̂⁻¹ b  ≈  Pᵀ Uᵀ U P b  (in P-perm we work with cp). -----
-        bp = b[self.P]
-        cp = self.U.T @ (self.U @ bp)
+        Ut_csr   = self.U_tilde.T.tocsr()
+        Utop_csr = self.U_tilde.tocsr()
 
-        # ----- Step 2: solve  A αp = cp  via CG with Ũ-preconditioner.
-        # In P-perm:  A_perm = R⁻¹_perm + UᵀU.  Matvec is two sparse matvecs.
-        UTU = self.U.T.dot(self.U).tocsr()      # cheap to form; nnz ~ same as UᵀU
-        R_inv_perm = self.R_inv_perm
-
-        def A_matvec(v):
-            return R_inv_perm * v + UTU @ v
+        # Symmetric SMW-form preconditioner — same matrix as the paper's
+        # chain via Sherman-Morrison.
+        def Minv_matvec(v):
+            t = np.empty_like(v); t[self.P] = self.R_inv_perm * v[self.P]
+            tp = t[self.P]
+            y = scipy.sparse.linalg.spsolve_triangular(Ut_csr,   tp, lower=True)
+            z = scipy.sparse.linalg.spsolve_triangular(Utop_csr, y,  lower=False)
+            u = np.empty_like(v); u[self.P] = z
+            Rinv_u = np.empty_like(v); Rinv_u[self.P] = self.R_inv_perm * u[self.P]
+            return t - Rinv_u
 
         A_op = scipy.sparse.linalg.LinearOperator(
-            (N, N), matvec=A_matvec, dtype=np.float64,
+            (N, N), matvec=lambda v: self.apply_Sigma(v), dtype=np.float64,
         )
-
-        Ut_csr = self.U_tilde.T.tocsr()
-        U_csr  = self.U_tilde.tocsr()
-
-        def M_matvec(v):
-            # Ũᵀ Ũ-solve: Ũᵀ y = v, then Ũ z = y.
-            y = scipy.sparse.linalg.spsolve_triangular(Ut_csr, v, lower=True)
-            z = scipy.sparse.linalg.spsolve_triangular(U_csr,  y, lower=False)
-            return z
-
         M_op = scipy.sparse.linalg.LinearOperator(
-            (N, N), matvec=M_matvec, dtype=np.float64,
+            (N, N), matvec=Minv_matvec, dtype=np.float64,
         )
-
-        # warm start: αp ≈ Ũ⁻¹ Ũ⁻ᵀ cp
-        alpha_p_x0 = M_matvec(cp)
-        alpha_p, _info = scipy.sparse.linalg.cg(
-            A_op, cp, x0=alpha_p_x0, M=M_op, rtol=rtol, maxiter=maxiter,
+        x0 = Minv_matvec(b)
+        x, _info = scipy.sparse.linalg.cg(
+            A_op, b, x0=x0, M=M_op, rtol=rtol, maxiter=maxiter,
         )
-
-        # ----- Step 3: α = Pᵀ αp,  then x = R⁻¹ α (diagonal in original order). -----
-        alpha = np.empty_like(b); alpha[self.P] = alpha_p
-        out = np.empty_like(b)
-        out[self.P] = self.R_inv_perm * alpha[self.P]
-        return out
+        return x

@@ -66,21 +66,15 @@ def test_noisy_ichol_factorization():
     explicit = kl.ExplicitKLFactorization(implicit, nugget=0.0, backend='cpu')
 
     K = kernel(m).astype(np.float64)
-    # Moderate-to-large noise σ² = 10: this is the regime where Algorithm 4.1
-    # is designed to work cleanly. The algorithm computes Σ_approx⁻¹ b
-    # exactly (modulo CG tolerance) where Σ_approx uses Θ̂⁻¹ ≈ Pᵀ UᵀU P.
-    # At small σ² the *inverse-form* matvec error becomes large compared to
-    # the small-noise term (paper §4.1's "for small ρ accuracy can harm"
-    # caveat); for that regime use a tighter U or do outer pCG on Σ.
-    sigma2 = 10.0
+    sigma2 = 1.0
     Sigma = K + sigma2 * np.eye(N)
     b = rng.standard_normal(N)
     x_exact = np.linalg.solve(Sigma, b)
 
     noisy = kl.NoisyExplicitKLFactorization.build(explicit, R=sigma2)
 
-    # Sanity: ichol's Ũ has the same sparsity pattern as the noiseless U.
-    assert noisy.U_tilde.nnz == explicit.U.nnz
+    # Sanity: ichol on the LL⊤ pattern (paper §4.1) gives Ũ ≥ U in nnz.
+    assert noisy.U_tilde.nnz >= explicit.U.nnz
     assert noisy.U_tilde.shape == explicit.U.shape
 
     # forward apply: Σ v = Θ v + R v
@@ -89,12 +83,13 @@ def test_noisy_ichol_factorization():
     err_apply = np.linalg.norm(y_approx - Sigma @ v) / np.linalg.norm(Sigma @ v)
     assert err_apply < 1e-2, f'apply_Sigma rel err = {err_apply}'
 
-    # Paper §4.1 algorithm: inner CG on (R⁻¹ + Θ̂⁻¹) α = c, with Ũ as
-    # preconditioner. At moderate noise this gives Σ_approx⁻¹ b within
-    # ~few-% of Σ_true⁻¹ b.
-    x_cg = noisy.solve_Sigma(b, rtol=1e-8, maxiter=200)
+    # Paper §4.1: outer CG on Σ x = b with the ichol-derived preconditioner.
+    # Per paper line 770: "the accuracy for solving systems of equations in
+    # Σ can easily be increased by adding a few iterations of conjugate
+    # gradient." At ρ=4 and σ²=1 we get dense-equivalent accuracy.
+    x_cg = noisy.solve_Sigma(b, rtol=1e-8, maxiter=100)
     err_cg = np.linalg.norm(x_cg - x_exact) / np.linalg.norm(x_exact)
-    assert err_cg < 0.2, f'solve_Sigma rel err = {err_cg}'
+    assert err_cg < 1e-2, f'solve_Sigma rel err = {err_cg}'
 
 
 def test_kolesky_factorization_roundtrip():
