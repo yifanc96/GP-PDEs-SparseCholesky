@@ -1,60 +1,49 @@
-"""2-D Darcy inverse problem via alternating sparse Cholesky + Algorithm 4.1.
+"""2-D Darcy inverse problem at scale via sparse Cholesky + joint GN + pCG.
 
-Sibling of ``examples/darcy_inverse.py``: the dense version pays O(N³)
-for Cholesky and stores Theta_u of size (N_bdy + 4·N_dom)² ~ 1 GB at
-N_dom = 2500. This file uses an *alternating* (Gauss-Seidel) scheme
-where each subproblem is a single-kernel GP regression — making the
-Algorithm 4.1 noisy ichol of Schäfer-Katzfuss-Owhadi (2020) directly
-applicable:
+Sibling of ``examples/darcy_inverse.py``: same Gauss-Newton formulation
+on the joint ``z = (w0, w1, w2, v0, v1, v2)`` variables (length 6 N_dom),
+with the same loss
 
-    u-subproblem (w fixed at w_old):
-        −Δu − ∇w_old · ∇u = f · exp(−w_old)        (interior)
-        u = 0                                       (boundary)
-        u(x_data_k) ≈ data_k        with σ² noise   (likelihood)
+    L(z) = ‖L_w⁻¹ w_all‖² + ‖L_u⁻¹ v_all‖² + (1/σ²) ‖v0[:Nd] − data‖²
 
-      → noisy GP regression, single u-field, partial-diagonal R on data
-        rows. Apply Algorithm 4.1 verbatim: build sparse Cholesky of
-        K_u_train, ichol on top to add R, solve_Sigma for outer pCG.
+and the same linearization of v3 = −v1·w1 − v2·w2 − f·exp(−w0) at the
+current iterate. The *only* difference is that the dense Cholesky factors
+``L_u`` (size N_bdy + 4·N_dom) and ``L_w`` (size 3·N_dom) are replaced by
+**sparse KL factors** ``U_u``, ``U_w`` from kolesky's
+``ImplicitKLFactorization.build_diracs_first_then_unif_scale``, with
+``U_uᵀ U_u ≈ Θ_u⁻¹`` and ``U_wᵀ U_w ≈ Θ_w⁻¹`` (in the maximin permuted
+order). The GN Hessian-vector product
 
-    w-subproblem (u fixed at u_new):
-        −∇u_new · ∇w + f · exp(−w_old) · w
-              = f · exp(−w_old) · (1 + w_old) + Δu_new          (interior)
+    H q = 2 J_vᵀ (U_uᵀ U_u) J_v q  +  2 J_wᵀ (U_wᵀ U_w) J_w q
+        + (2/σ²) E_dataᵀ E_data q
 
-      → *noiseless* GP regression, single w-field. Sparse Cholesky alone.
+is then a chain of *exact* sparse matvecs — no inner CG, no inverse
+approximation: ``UᵀU`` is the defining sparse primitive that the GP
+regression's loss inner-product uses, equal to ``L⁻ᵀ L⁻¹`` in the dense
+version's notation. pCG drives each GN step.
 
-Iterate u-, then-w-, then-u-, … until both converge.
+The dense version pays O((N_bdy + 4 N_dom)³) for L_u Cholesky and stores
+~10 000² ≈ 1 GB of dense kernel at N_dom = 2500 — intractable. The
+sparse factors store only O(N · ρᵈ) entries (~10⁵ at ρ=3).
 
-**Status / known issues.**
+**Status.** The Hessian-vector apply matches the dense version's
+``hess_GN_at_zold`` exactly when the sparse factors are accurate. In
+practice, at moderate ρ the GP-prior Hessian's condition number is
+amplified by the kernel matrix's, and the simple Jacobi preconditioner
+used here is not strong enough for outer pCG to drive the GN linear
+solve to a useful step — divergence after a few GN iterations is
+typical at ρ = 3 / 4. Stabilization paths the user can iterate on:
 
-  * The Algorithm 4.1 ichol step is correctly applied to the u-subproblem
-    — sparse big factor + ichol with R = σ² on data rows + ε on others.
-    `solve_Sigma` drives outer pCG to dense-equivalent accuracy on the
-    u-step linear system. (Verified end-to-end against
-    ``tests/test_smoke.py::test_noisy_ichol_factorization``.)
-  * The alternating outer iteration in this file is *unstable* at w=0
-    initialization for the standard Darcy test (fluctuating signs, NaNs
-    after a few iterates). Two failure modes contributing:
+  * Stronger preconditioner — e.g. assemble the sparse Hessian
+    explicitly (``H = J_vᵀ UᵀU J_v + …`` is sparse with O(N · ρ²ᵈ)
+    nonzeros) and run a sparse direct solve at each GN step.
+  * Outer-iteration damping (line search / under-relaxation).
+  * Larger ρ (denser sparse factor) — accuracy of UᵀU as Θ⁻¹
+    improves quadratically with ρ.
 
-    1. The w-subproblem's linearized PDE
-       ``-∇u·∇w + f·exp(-w_old)·w = ...``
-       is *first-order* in w (no Δw term), so it isn't a standard
-       elliptic operator and the maximin-based KL factor is not the
-       natural support for its inverse. A standard fix is to add a
-       small Δw regularization (or use a stronger w-prior).
-    2. The Δu_new term in the w-subproblem rhs amplifies u-step
-       errors, especially at trivial w=0 init where the PDE constraint
-       is not a useful prior on w.
-
-  * To stabilize: (i) better init (e.g. solve a single forward Darcy
-    with assumed a≡1 to seed u, then refine w); (ii) damping in the
-    outer iteration (w_new := w_old + α(w_solve − w_old) for α<1);
-    (iii) regularize w-subproblem with a tiny Δw term.
-
-For a *working* end-to-end inverse-problem demo, see
-``examples/darcy_inverse.py`` (dense, N_dom ~ 200, ~26% rel err on a).
-This sparse alternating file is the scaffold for scaling up; the
-noisy-ichol piece works correctly, the outer alternation needs the
-stabilization fixes above.
+The dense ``examples/darcy_inverse.py`` (N_dom ~ 200, ~26 % rel err on
+``a``) is the working baseline; this file is the scaffold for scaling
+up via sparse factors with the joint-GN structure unchanged.
 """
 
 from __future__ import annotations
@@ -62,11 +51,9 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
-import scipy.linalg
 import scipy.sparse
 import scipy.sparse.linalg as spla
 
@@ -98,6 +85,11 @@ def fd_darcy_forward(N: int, fun_a, f) -> np.ndarray:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Big-factor measurement groups (5-set for u, 3-set for w with dummy bdy).
+# ---------------------------------------------------------------------------
+
+
 def _lgd(coord, wL, wG, wD):
     from kolesky.measurements import LaplaceGradDiracPointMeasurement
     return LaplaceGradDiracPointMeasurement(
@@ -108,258 +100,216 @@ def _lgd(coord, wL, wG, wD):
     )
 
 
-# ---------------------------------------------------------------------------
-# Indexed-measurement / dense-lookup-kernel pair.
-# Lets kolesky run its sparse Cholesky pipeline on a precomputed dense
-# kernel matrix without us having to introduce a new measurement type
-# at the kolesky core.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _IndexedMeas:
-    coordinate: np.ndarray
-    indices: np.ndarray
-
-    @property
-    def d(self):
-        return self.coordinate.shape[-1]
-
-    def is_batched(self):
-        return self.coordinate.ndim == 2
-
-
-def _patch_kolesky_select_for_indexed_meas():
-    """Idempotently monkey-patch ``kolesky.measurements.select`` so it
-    knows how to subset our ``_IndexedMeas`` (subset both the
-    coordinates *and* the integer indices into the precomputed K matrix)."""
-    import kolesky.measurements as _km
-    if getattr(_km.select, '_patched_for_indexed', False):
-        return
-    _orig = _km.select
-    def _patched(meas, idx):
-        if isinstance(meas, _IndexedMeas):
-            idx = np.asarray(idx, dtype=np.int64)
-            return _IndexedMeas(coordinate=meas.coordinate[idx],
-                                indices=meas.indices[idx])
-        return _orig(meas, idx)
-    _patched._patched_for_indexed = True
-    _km.select = _patched
-
-
-class _DenseLookupKernel:
-    """Kernel callable that slices a precomputed dense kernel matrix.
-    Plays the role of an ``AbstractCovarianceFunction`` for kolesky's
-    sparse-Cholesky pipeline."""
-    def __init__(self, K: np.ndarray):
-        self.K = K
-
-    def __call__(self, meas_a, meas_b=None):
-        idx_a = meas_a.indices
-        idx_b = meas_b.indices if meas_b is not None else idx_a
-        return self.K[np.ix_(idx_a, idx_b)]
-
-
-# ---------------------------------------------------------------------------
-# Sparse Cholesky + Algorithm 4.1 ichol on an arbitrary dense kernel matrix.
-# ---------------------------------------------------------------------------
-
-
-def _sparse_factor_with_noise(K_dense, train_coord, R_diag,
-                              rho=3.0, k_neighbors=3, nugget=1e-10,
-                              verbose=True, tag=''):
-    """Given a dense kernel matrix ``K_dense`` (size N_train × N_train)
-    over points ``train_coord``, plus a diagonal-noise vector ``R_diag``,
-    build a ``NoisyExplicitKLFactorization`` whose
-    ``solve_Sigma(b) ≈ (K + R)⁻¹ b`` to dense-equivalent accuracy."""
-    import kolesky as kl
-    _patch_kolesky_select_for_indexed_meas()
-    Ntot = K_dense.shape[0]
-    if nugget > 0:
-        diag_mean = float(np.diag(K_dense).mean())
-        K_dense = K_dense.copy()
-        K_dense[np.arange(Ntot), np.arange(Ntot)] += nugget * diag_mean
-    train_meas = _IndexedMeas(coordinate=np.asarray(train_coord, dtype=np.float64),
-                              indices=np.arange(Ntot, dtype=np.int64))
-    kernel_lookup = _DenseLookupKernel(K_dense)
-
-    t0 = time.perf_counter()
-    impl = kl.ImplicitKLFactorization.build(
-        kernel_lookup, train_meas, rho=rho, k_neighbors=k_neighbors,
-    )
-    expl = kl.ExplicitKLFactorization(impl, nugget=0.0, backend='cpu')
-    t_chol = time.perf_counter() - t0
-    if verbose:
-        print(f'    [{tag}] sparse Chol: {expl.U.shape}, nnz = {expl.U.nnz:,}, '
-              f'{t_chol:.2f} s')
-
-    if R_diag is None:
-        return expl, None     # no noise needed
-
-    t0 = time.perf_counter()
-    noisy = kl.NoisyExplicitKLFactorization.build(expl, R=R_diag)
-    t_ichol = time.perf_counter() - t0
-    if verbose:
-        print(f'    [{tag}] ichol (Alg 4.1): nnz = {noisy.U_tilde.nnz:,}, '
-              f'{t_ichol:.2f} s')
-    return expl, noisy
-
-
-# ---------------------------------------------------------------------------
-# u-subproblem: solve for u given w_old (and ∇w_old).
-# ---------------------------------------------------------------------------
-
-
-def _solve_u_subproblem(w_old, gw_old, X_dom, X_bdy, Nd, rhs_f, data_noisy,
-                        sigma2, kernel, rho, k_neighbors, nugget,
-                        eps_off_data, pcg_rtol, pcg_maxiter, verbose,
-                        return_lap_u=False):
-    """Linear elliptic in u:
-        L_u(u) := -Δu - ∇w_old · ∇u = f · exp(-w_old)        on interior
-        u = 0                                                  on ∂Ω
-        u(x_data_k) ≈ data_k                  (noisy, σ² var)
-
-    Train measurements are 3 groups: [bdy_δ, data_δ, PDE_u_int]. We
-    factor the dense ``K_u_train`` via kolesky + ichol (Algorithm 4.1)
-    with R = σ² · E_data + ε · I (tiny ε on non-data rows so R⁻¹ is
-    well-defined; effect on the answer is negligible)."""
-    Nb = X_bdy.shape[0]; N = X_dom.shape[0]
-    Ntot = Nb + Nd + N
-
-    # Train measurements (u-side only).
-    c_old = rhs_f * np.exp(-w_old)
-    train_u = [
-        _lgd(X_bdy,        np.zeros(Nb), np.zeros((Nb, 2)), np.ones(Nb)),
-        _lgd(X_dom[:Nd],   np.zeros(Nd), np.zeros((Nd, 2)), np.ones(Nd)),
-        _lgd(X_dom,        -np.ones(N),  -gw_old,            np.zeros(N)),
+def _theta_u_groups(X_dom: np.ndarray, X_bdy: np.ndarray):
+    """5 sets in the natural order [δ_bdy, δ_int, ∂₁_int, ∂₂_int, Δ_int]."""
+    N = X_dom.shape[0]; Nb = X_bdy.shape[0]
+    e1 = np.tile(np.array([1.0, 0.0]), (N, 1))
+    e2 = np.tile(np.array([0.0, 1.0]), (N, 1))
+    return [
+        _lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)), np.ones(Nb)),
+        _lgd(X_dom, np.zeros(N),  np.zeros((N, 2)),  np.ones(N)),
+        _lgd(X_dom, np.zeros(N),  e1,                np.zeros(N)),
+        _lgd(X_dom, np.zeros(N),  e2,                np.zeros(N)),
+        _lgd(X_dom, np.ones(N),   np.zeros((N, 2)),  np.zeros(N)),
     ]
-    import kolesky as kl
-    train_u_stack = kl.stack_measurements(train_u)
-
-    K_u = np.asarray(kernel(train_u_stack, train_u_stack), dtype=np.float64)
-    K_u = 0.5 * (K_u + K_u.T)
-
-    # Train coordinates for the sparse-Cholesky ordering (matches K_u rows).
-    train_coord = np.vstack([X_bdy, X_dom[:Nd], X_dom])
-
-    # Noise: σ² on data rows, tiny ε on others.
-    R_diag = np.full(Ntot, eps_off_data, dtype=np.float64)
-    R_diag[Nb:Nb + Nd] = sigma2
-
-    expl_u, noisy_u = _sparse_factor_with_noise(
-        K_u, train_coord, R_diag,
-        rho=rho, k_neighbors=k_neighbors, nugget=nugget,
-        verbose=verbose, tag='u-subproblem',
-    )
-
-    # RHS for u-subproblem.
-    rhs_pde_u = c_old.copy()                 # f · exp(-w_old)
-    y_train = np.concatenate([np.zeros(Nb), data_noisy, rhs_pde_u])
-
-    # Solve (K_u + R) α = y via paper §4.1 outer CG.
-    t0 = time.perf_counter()
-    alpha_u = noisy_u.solve_Sigma(y_train, rtol=pcg_rtol, maxiter=pcg_maxiter)
-    if verbose:
-        print(f'    [u-subproblem] solve_Sigma: {time.perf_counter()-t0:.2f} s')
-
-    # Predict u, ∇₁u, ∇₂u at interior.
-    test_u_d  = _lgd(X_dom, np.zeros(N), np.zeros((N, 2)), np.ones(N))
-    test_u_d1 = _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N))
-    test_u_d2 = _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N))
-    K_test_d  = np.asarray(kernel(test_u_d,  train_u_stack), dtype=np.float64)
-    K_test_d1 = np.asarray(kernel(test_u_d1, train_u_stack), dtype=np.float64)
-    K_test_d2 = np.asarray(kernel(test_u_d2, train_u_stack), dtype=np.float64)
-    u_new   = K_test_d  @ alpha_u
-    gu_new  = np.stack([K_test_d1 @ alpha_u, K_test_d2 @ alpha_u], axis=1)
-
-    if return_lap_u:
-        # Δu at interior points — needed by the w-subproblem rhs because the
-        # u-subproblem's PDE constraint is *softly* satisfied (data fidelity
-        # can override it at data points), so we cannot eliminate Δu_new via
-        # the PDE identity.
-        test_u_lap = _lgd(X_dom, np.ones(N), np.zeros((N, 2)), np.zeros(N))
-        K_test_lap = np.asarray(kernel(test_u_lap, train_u_stack), dtype=np.float64)
-        lap_u_new = K_test_lap @ alpha_u
-        return u_new, gu_new, lap_u_new, alpha_u, train_u_stack
-    return u_new, gu_new, alpha_u, train_u_stack
 
 
-# ---------------------------------------------------------------------------
-# w-subproblem: solve for w given u_new (no noise).
-# ---------------------------------------------------------------------------
+def _theta_w_groups(X_dom: np.ndarray):
+    """3 sets in the natural order [(dummy bdy), δ_int, ∂₁_int, ∂₂_int].
 
-
-def _solve_w_subproblem(u_new, gu_new, lap_u_new, w_old, gw_old, X_dom, rhs_f, kernel,
-                        rho, k_neighbors, nugget, eps_off_data,
-                        pcg_rtol, pcg_maxiter, verbose):
-    """Linear in w (linearizing exp(-w) around w_old):
-        L_w(w) := -∇u_new · ∇w + f · c_old · w
-               = f · c_old · (1 + w_old) + Δu_new       on interior
-
-    Train: PDE_w at all interior points only. No boundary, no data, no
-    noise — pure GP regression with the prior on w. Sparse Cholesky
-    suffices (no ichol needed)."""
+    The single faraway dummy boundary point lets us reuse
+    ``build_diracs_first_then_unif_scale`` (which expects a non-empty
+    boundary set); we leave its row at 0 in the loss / Hessian below."""
     N = X_dom.shape[0]
-    c_old = rhs_f * np.exp(-w_old)
-    train_w = _lgd(X_dom, np.zeros(N), -gu_new, c_old)
+    e1 = np.tile(np.array([1.0, 0.0]), (N, 1))
+    e2 = np.tile(np.array([0.0, 1.0]), (N, 1))
+    dummy = np.array([[10.0, 10.0]])
+    return [
+        _lgd(dummy, np.zeros(1), np.zeros((1, 2)), np.ones(1)),
+        _lgd(X_dom, np.zeros(N), np.zeros((N, 2)), np.ones(N)),
+        _lgd(X_dom, np.zeros(N), e1,               np.zeros(N)),
+        _lgd(X_dom, np.zeros(N), e2,               np.zeros(N)),
+    ]
 
-    import kolesky as kl
-    K_w = np.asarray(kernel(train_w, train_w), dtype=np.float64)
-    K_w = 0.5 * (K_w + K_w.T)
 
-    expl_w, _ = _sparse_factor_with_noise(
-        K_w, X_dom, R_diag=None,
-        rho=rho, k_neighbors=k_neighbors, nugget=nugget,
-        verbose=verbose, tag='w-subproblem',
-    )
+# ---------------------------------------------------------------------------
+# Joint-GN helpers: pack z into the natural-order vectors v_all, w_all,
+# matching the U_u and U_w big-factor row layouts.
+# ---------------------------------------------------------------------------
+#
+# z layout (6N)            : [ w0 | w1 | w2 | v0 | v1 | v2 ]
+# v_all natural order (Nb+4N): [ bdy_g | v0 | v1 | v2 | v3_lin ]
+# w_all natural order (1+3N) : [ 0 (dummy) | w0 | w1 | w2 ]
+# v3_lin (linearized v3 at z_old) :
+#   v3_lin = c_w0·w0 + c_w1·w1 + c_w2·w2 + c_v1·v1 + c_v2·v2
+# where the coefs come from ∂v3/∂z|z_old:
+#   c_w0 =  f · exp(−w0_old)
+#   c_w1 = −v1_old,    c_w2 = −v2_old
+#   c_v1 = −w1_old,    c_v2 = −w2_old
+# (matches darcy_inverse.py's GN_loss exactly).
 
-    # rhs at PDE rows.  The GN linearization of exp(-w) at w_old gives
-    # the linear-in-w PDE  -∇u_new·∇w + f·c_old·w = f·c_old·(1+w_old) + Δu_new,
-    # where Δu_new is what u_new actually has (NOT the PDE-identity value;
-    # data fidelity can pull u_new off the PDE at observation points, so
-    # we evaluate Δu via the u-subproblem's predictor).
-    y_train = c_old * (1.0 + w_old) + lap_u_new
 
-    # Apply Theta_w⁻¹ via the sparse forward apply:  α = Pᵀ (UᵀU)⁻¹ P · ... no,
-    # we want (K_w)⁻¹ y; but we only have UᵀU ≈ K_w⁻¹ (matvec form, less
-    # accurate). Use outer pCG on K_w x = y with the noisy ichol's symmetric
-    # SMW-form preconditioner — but we have no R, so just dense Cholesky here
-    # if N is moderate, else sparse + outer pCG with U-fwd preconditioner.
-    # Simplest: Cholesky via U-fwd-apply matvec + Jacobi precond CG.
-    U_csr  = expl_w.U.tocsr()
-    UT_csr = expl_w.U.T.tocsr()
-    P_w = expl_w.P
-    def K_w_apply(v):
-        vp = v[P_w]
-        y = spla.spsolve_triangular(U_csr, vp, lower=False)
-        z = spla.spsolve_triangular(UT_csr, y, lower=True)
-        out = np.empty_like(v); out[P_w] = z
+def _coefs(z, rhs_f, N):
+    w0 = z[0:N]; w1 = z[N:2*N]; w2 = z[2*N:3*N]
+    v1 = z[4*N:5*N]; v2 = z[5*N:6*N]
+    return (rhs_f * np.exp(-w0), -v1, -v2, -w1, -w2)
+
+
+def _v3_nonlinear(z, rhs_f, N):
+    w0 = z[0:N]; w1 = z[N:2*N]; w2 = z[2*N:3*N]
+    v1 = z[4*N:5*N]; v2 = z[5*N:6*N]
+    return -v1 * w1 - v2 * w2 - rhs_f * np.exp(-w0)
+
+
+def _pack_v_all(z, v3_vals, bdy_g, N, Nb):
+    v0 = z[3*N:4*N]; v1 = z[4*N:5*N]; v2 = z[5*N:6*N]
+    out = np.empty(Nb + 4*N)
+    out[0:Nb]                  = bdy_g
+    out[Nb     : Nb +   N]     = v0
+    out[Nb +   N : Nb + 2 * N] = v1
+    out[Nb + 2*N : Nb + 3 * N] = v2
+    out[Nb + 3*N : Nb + 4 * N] = v3_vals
+    return out
+
+
+def _pack_w_all(z, N):
+    out = np.zeros(1 + 3 * N)            # dummy bdy row stays at 0
+    out[1     : 1 +   N]                 = z[0:N]
+    out[1 +   N : 1 + 2 * N]             = z[N:2*N]
+    out[1 + 2*N : 1 + 3 * N]             = z[2*N:3*N]
+    return out
+
+
+def _unpack_v_grad(y_u, coefs, N, Nb):
+    """Apply Jᵥᵀ to a length-(Nb + 4N) vector y_u in v_all natural order.
+    Returns a 6N-vector in z layout."""
+    c_w0, c_w1, c_w2, c_v1, c_v2 = coefs
+    yv0 = y_u[Nb     : Nb +   N]
+    yv1 = y_u[Nb +   N : Nb + 2 * N]
+    yv2 = y_u[Nb + 2*N : Nb + 3 * N]
+    yv3 = y_u[Nb + 3*N : Nb + 4 * N]
+    out = np.empty(6 * N)
+    out[0    : 1 * N] = c_w0 * yv3
+    out[1*N  : 2 * N] = c_w1 * yv3
+    out[2*N  : 3 * N] = c_w2 * yv3
+    out[3*N  : 4 * N] = yv0
+    out[4*N  : 5 * N] = yv1 + c_v1 * yv3
+    out[5*N  : 6 * N] = yv2 + c_v2 * yv3
+    return out
+
+
+def _unpack_w_grad(y_w, N):
+    """Apply J_wᵀ to a length-(1 + 3N) vector y_w in w_all natural order.
+    Returns a 6N-vector (only the w-block is nonzero)."""
+    out = np.zeros(6 * N)
+    out[0    : 1 * N] = y_w[1            : 1 +   N]
+    out[1*N  : 2 * N] = y_w[1 +   N : 1 + 2 * N]
+    out[2*N  : 3 * N] = y_w[1 + 2*N : 1 + 3 * N]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Sparse-factor matvec: applies (Pᵀ UᵀU P) v exactly (no triangular solves;
+# no inverse approximation — this IS the loss-side primitive in the GP
+# regression, equal to ``L⁻ᵀ L⁻¹`` in the dense version's notation, computed
+# via two sparse matvecs).
+# ---------------------------------------------------------------------------
+
+
+class _SparseFactorInv:
+    __slots__ = ('UTU_csr', 'P')
+
+    def __init__(self, explicit):
+        # Precompute UᵀU once. nnz(UᵀU) ≤ symbolic UᵀU pattern,
+        # = O(N · ρ²ᵈ) — same asymptotic as the factor itself.
+        UTU = (explicit.U.T @ explicit.U).tocsr()
+        UTU.sort_indices()
+        self.UTU_csr = UTU
+        self.P = np.asarray(explicit.P, dtype=np.int64)
+
+    def apply(self, v: np.ndarray) -> np.ndarray:
+        """Apply ``Pᵀ (UᵀU) P v`` — the sparse factor's matvec form, equal
+        to applying Theta_approx⁻¹ on v. One sparse matvec + two
+        permutations. NO inverse approximation issue: this *is* the
+        defining sparse primitive that the GN loss inner-product uses."""
+        vp = v[self.P]
+        z = self.UTU_csr @ vp
+        out = np.empty_like(v); out[self.P] = z
         return out
-    def K_w_inv_apply(v):     # cheap one-shot preconditioner
-        vp = v[P_w]
-        z = expl_w.U.T @ (expl_w.U @ vp)
-        out = np.empty_like(v); out[P_w] = z
-        return out
-    A_op = spla.LinearOperator((N, N), matvec=K_w_apply, dtype=np.float64)
-    M_op = spla.LinearOperator((N, N), matvec=K_w_inv_apply, dtype=np.float64)
-    t0 = time.perf_counter()
-    x0 = K_w_inv_apply(y_train)
-    alpha_w, _info = spla.cg(A_op, y_train, x0=x0, M=M_op,
-                              rtol=pcg_rtol, maxiter=pcg_maxiter)
-    if verbose:
-        print(f'    [w-subproblem] solve K_w α = y: {time.perf_counter()-t0:.2f} s')
 
-    # Predict w, ∇₁w, ∇₂w at interior.
-    test_w_d  = _lgd(X_dom, np.zeros(N), np.zeros((N, 2)), np.ones(N))
-    test_w_d1 = _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N))
-    test_w_d2 = _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N))
-    K_test_d  = np.asarray(kernel(test_w_d,  train_w), dtype=np.float64)
-    K_test_d1 = np.asarray(kernel(test_w_d1, train_w), dtype=np.float64)
-    K_test_d2 = np.asarray(kernel(test_w_d2, train_w), dtype=np.float64)
-    w_new  = K_test_d  @ alpha_w
-    gw_new = np.stack([K_test_d1 @ alpha_w, K_test_d2 @ alpha_w], axis=1)
 
-    return w_new, gw_new, alpha_w, train_w
+# ---------------------------------------------------------------------------
+# GN gradient and Hessian-vector product at the current iterate z.
+# Mirrors examples/darcy_inverse.py's loss / GN_loss / hess_GN_at_zold,
+# but with each Theta_*⁻¹ apply replaced by a sparse-factor matvec.
+# ---------------------------------------------------------------------------
+
+
+def _full_grad(z, sf_u, sf_w, rhs_f, bdy_g, data, N, Nb, N_data, sigma):
+    """Gradient of the *nonlinear* loss at z (uses exact v3, NOT linearized)."""
+    v3 = _v3_nonlinear(z, rhs_f, N)
+    v_all = _pack_v_all(z, v3, bdy_g, N, Nb)
+    w_all = _pack_w_all(z, N)
+
+    y_u = sf_u.apply(v_all)
+    y_w = sf_w.apply(w_all)
+
+    coefs = _coefs(z, rhs_f, N)
+    g  = 2.0 * _unpack_v_grad(y_u, coefs, N, Nb)
+    g += 2.0 * _unpack_w_grad(y_w, N)
+    v0 = z[3*N:4*N]
+    g[3*N : 3*N + N_data] += (2.0 / sigma**2) * (v0[:N_data] - data)
+    return g
+
+
+def _gn_hess_matvec(q, z, sf_u, sf_w, rhs_f, N, Nb, N_data, sigma):
+    """GN Hessian (linearized v3 at z) applied to q. Mirrors hess_GN_at_zold."""
+    coefs = _coefs(z, rhs_f, N)
+    c_w0, c_w1, c_w2, c_v1, c_v2 = coefs
+    qw0 = q[0:N]; qw1 = q[N:2*N]; qw2 = q[2*N:3*N]
+    qv0 = q[3*N:4*N]; qv1 = q[4*N:5*N]; qv2 = q[5*N:6*N]
+    qv3 = c_w0*qw0 + c_w1*qw1 + c_w2*qw2 + c_v1*qv1 + c_v2*qv2
+
+    Jvq = _pack_v_all(q, qv3, np.zeros(Nb), N, Nb)
+    Jwq = _pack_w_all(q, N)
+    yu = sf_u.apply(Jvq)
+    yw = sf_w.apply(Jwq)
+
+    out  = 2.0 * _unpack_v_grad(yu, coefs, N, Nb)
+    out += 2.0 * _unpack_w_grad(yw, N)
+    out[3*N : 3*N + N_data] += (2.0 / sigma**2) * qv0[:N_data]
+    return out
+
+
+def _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, N_data, sigma):
+    """Diagonal of the GN Hessian (Jacobi preconditioner)."""
+    # diag(UᵀU)_ii  =  ‖U[:, i]‖² — column-norm-squared of the noiseless KL
+    # factor; we read it back into the natural order via the inverse perm.
+    diag_u_perm = np.asarray(sf_u.UTU_csr.diagonal()).ravel()
+    P_u_inv = np.empty_like(sf_u.P); P_u_inv[sf_u.P] = np.arange(sf_u.P.size)
+    diag_u_natural = diag_u_perm[P_u_inv]
+    dv0 = diag_u_natural[Nb     : Nb +   N]
+    dv1 = diag_u_natural[Nb +   N : Nb + 2 * N]
+    dv2 = diag_u_natural[Nb + 2*N : Nb + 3 * N]
+    dv3 = diag_u_natural[Nb + 3*N : Nb + 4 * N]
+
+    diag_w_perm = np.asarray(sf_w.UTU_csr.diagonal()).ravel()
+    P_w_inv = np.empty_like(sf_w.P); P_w_inv[sf_w.P] = np.arange(sf_w.P.size)
+    diag_w_natural = diag_w_perm[P_w_inv]
+    dw0 = diag_w_natural[1            : 1 +   N]
+    dw1 = diag_w_natural[1 +   N      : 1 + 2 * N]
+    dw2 = diag_w_natural[1 + 2*N      : 1 + 3 * N]
+
+    c_w0, c_w1, c_w2, c_v1, c_v2 = _coefs(z, rhs_f, N)
+    H = np.empty(6 * N)
+    H[0    :   N]   = 2.0 * (c_w0**2 * dv3 + dw0)
+    H[N    : 2*N]   = 2.0 * (c_w1**2 * dv3 + dw1)
+    H[2*N  : 3*N]   = 2.0 * (c_w2**2 * dv3 + dw2)
+    H[3*N  : 4*N]   = 2.0 * dv0
+    H[3*N : 3*N + N_data] += 2.0 / sigma**2
+    H[4*N  : 5*N]   = 2.0 * (dv1 + c_v1**2 * dv3)
+    H[5*N  : 6*N]   = 2.0 * (dv2 + c_v2**2 * dv3)
+    return 1.0 / np.maximum(H, 1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -380,12 +330,9 @@ def parse_args(argv=None):
     p.add_argument('--rho', type=float, default=3.0)
     p.add_argument('--k-neighbors', type=int, default=3)
     p.add_argument('--nugget', type=float, default=1e-8)
-    p.add_argument('--eps-off-data', type=float, default=1e-10,
-                   help='tiny noise ε on non-data train rows so the ichol R⁻¹ is finite')
-    p.add_argument('--outer-iters', type=int, default=8,
-                   help='number of alternating u/w sweeps')
-    p.add_argument('--pcg-rtol', type=float, default=1e-6)
-    p.add_argument('--pcg-maxiter', type=int, default=80)
+    p.add_argument('--GN-steps', type=int, default=6)
+    p.add_argument('--pcg-rtol', type=float, default=1e-5)
+    p.add_argument('--pcg-maxiter', type=int, default=400)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--out', default='docs/darcy_inverse_sparse.png')
     return p.parse_args(argv)
@@ -404,14 +351,14 @@ def main(argv=None):
         'Matern9half': kl.MaternCovariance9_2,
     }
     kernel = kernels[args.kernel](args.kernel_sigma)
-    print(f'[setup]  kernel = {args.kernel}, σ_kernel = {args.kernel_sigma}, '
-          f'σ_noise = {args.noise}, ρ = {args.rho}')
+    print(f'[setup]  kernel = {args.kernel},  σ_kernel = {args.kernel_sigma},  '
+          f'σ_noise = {args.noise},  ρ = {args.rho}')
 
     # ----- ground truth via FD -----
     c_a = 1.0
     def a_truth(x1, x2):
-        return (np.exp(c_a * np.sin(2 * np.pi * x1) + c_a * np.sin(2 * np.pi * x2))
-                + np.exp(-c_a * np.sin(2 * np.pi * x1) - c_a * np.sin(2 * np.pi * x2)))
+        return (np.exp(c_a * np.sin(2*np.pi*x1) + c_a * np.sin(2*np.pi*x2))
+                + np.exp(-c_a * np.sin(2*np.pi*x1) - c_a * np.sin(2*np.pi*x2)))
     def f_rhs(x1, x2):
         return np.ones_like(x1)
 
@@ -431,54 +378,84 @@ def main(argv=None):
     ], axis=0)[:args.N_boundary]
     X_data = X_dom[:args.N_data]
     N = args.N_domain; Nb = X_bdy.shape[0]; Nd = args.N_data
-    print(f'[sample] N_dom = {N}, N_bdy = {Nb}, N_data = {Nd}')
+    print(f'[sample] N_dom = {N},  N_bdy = {Nb},  N_data = {Nd}')
 
-    # ----- noisy observations of u_truth at X_data -----
+    # ----- noisy observations -----
     from scipy.interpolate import RegularGridInterpolator
     grid_xs = np.linspace(0, 1, args.N_fd)
     interp = RegularGridInterpolator((grid_xs, grid_xs), u_truth.T)
     u_at_data = interp(X_data)
     data_noisy = u_at_data + args.noise * rng.standard_normal(Nd)
-    sigma2 = args.noise ** 2
 
+    # ----- sparse big factors built once outside GN loop -----
+    print('[big]    building U_u (5-set DiracsFirstThenUnifScale) …')
+    t0 = time.perf_counter()
+    impl_u = kl.ImplicitKLFactorization.build_diracs_first_then_unif_scale(
+        kernel, _theta_u_groups(X_dom, X_bdy),
+        rho=args.rho, k_neighbors=args.k_neighbors,
+    )
+    expl_u = kl.ExplicitKLFactorization(impl_u, nugget=args.nugget, backend='cpu')
+    print(f'[big]    U_u: shape = {expl_u.U.shape}, nnz = {expl_u.U.nnz:,}, '
+          f'wall = {time.perf_counter()-t0:.2f} s')
+    sf_u = _SparseFactorInv(expl_u)
+
+    print('[big]    building U_w (3-set + dummy bdy) …')
+    t0 = time.perf_counter()
+    impl_w = kl.ImplicitKLFactorization.build_diracs_first_then_unif_scale(
+        kernel, _theta_w_groups(X_dom),
+        rho=args.rho, k_neighbors=args.k_neighbors,
+    )
+    expl_w = kl.ExplicitKLFactorization(impl_w, nugget=args.nugget, backend='cpu')
+    print(f'[big]    U_w: shape = {expl_w.U.shape}, nnz = {expl_w.U.nnz:,}, '
+          f'wall = {time.perf_counter()-t0:.2f} s')
+    sf_w = _SparseFactorInv(expl_w)
+
+    # ----- joint GN iteration -----
     rhs_f = np.ones(N, dtype=np.float64)
+    bdy_g = np.zeros(Nb, dtype=np.float64)
+    sigma = args.noise
 
-    # ----- alternating GS iteration -----
-    u_old  = np.zeros(N); gu_old = np.zeros((N, 2))
-    w_old  = np.zeros(N); gw_old = np.zeros((N, 2))
-    last_alpha_u = None; last_train_u = None
-    last_alpha_w = None; last_train_w = None
+    z = rng.standard_normal(6 * N)        # same random init as the dense version
+    print(f'\n[GN]     {args.GN_steps} steps,  pCG rtol = {args.pcg_rtol},  '
+          f'maxiter = {args.pcg_maxiter}')
 
-    print(f'\n[GS]  {args.outer_iters} alternating u/w sweeps')
+    def _loss_value(z_):
+        v3 = _v3_nonlinear(z_, rhs_f, N)
+        v_all = _pack_v_all(z_, v3, bdy_g, N, Nb)
+        w_all = _pack_w_all(z_, N)
+        # Sparse-factor "L⁻¹ x" version: the loss term v_all · Theta_u⁻¹ · v_all
+        # equals v_all · (Pᵀ UᵀU P) · v_all = ‖U Pv_all‖².
+        Lu_v = expl_u.U @ v_all[expl_u.P]
+        Lw_w = expl_w.U @ w_all[expl_w.P]
+        v0 = z_[3*N:4*N]
+        return (Lu_v @ Lu_v + Lw_w @ Lw_w
+                + (1.0/sigma**2) * np.sum((v0[:Nd] - data_noisy)**2))
+
+    print(f'         iter  0:  loss = {_loss_value(z):.4e}')
     t_loop = time.perf_counter()
-    for step in range(1, args.outer_iters + 1):
-        print(f'  step {step}:')
-        # u-subproblem (noisy, Algorithm 4.1)
-        u_new, gu_new, lap_u_new, alpha_u, train_u = _solve_u_subproblem(
-            w_old, gw_old, X_dom, X_bdy, Nd, rhs_f, data_noisy, sigma2,
-            kernel, args.rho, args.k_neighbors, args.nugget,
-            args.eps_off_data, args.pcg_rtol, args.pcg_maxiter, verbose=True,
-            return_lap_u=True,
+    for step in range(1, args.GN_steps + 1):
+        g = _full_grad(z, sf_u, sf_w, rhs_f, bdy_g, data_noisy, N, Nb, Nd, sigma)
+        H_op = spla.LinearOperator(
+            (6*N, 6*N),
+            matvec=lambda q: _gn_hess_matvec(q, z, sf_u, sf_w, rhs_f, N, Nb, Nd, sigma),
+            dtype=np.float64,
         )
-        last_alpha_u = alpha_u; last_train_u = train_u
-
-        # w-subproblem (noiseless)
-        w_new, gw_new, alpha_w, train_w = _solve_w_subproblem(
-            u_new, gu_new, lap_u_new, w_old, gw_old, X_dom, rhs_f, kernel,
-            args.rho, args.k_neighbors, args.nugget,
-            args.eps_off_data, args.pcg_rtol, args.pcg_maxiter, verbose=True,
+        diag_inv = _diag_precond(sf_u, sf_w, z, rhs_f, N, Nb, Nd, sigma)
+        M_op = spla.LinearOperator(
+            (6*N, 6*N), matvec=lambda q: diag_inv * q, dtype=np.float64,
         )
-        last_alpha_w = alpha_w; last_train_w = train_w
+        it = [0]
+        t0 = time.perf_counter()
+        delta, info = spla.cg(H_op, g, M=M_op, rtol=args.pcg_rtol,
+                                maxiter=args.pcg_maxiter,
+                                callback=lambda _x: it.__setitem__(0, it[0]+1))
+        z = z - delta
+        loss_now = _loss_value(z)
+        print(f'         iter {step:2d}:  loss = {loss_now:.4e}    '
+              f'pCG: {it[0]:>3d} iters, {time.perf_counter()-t0:.2f} s')
+    print(f'[GN]     wall: {time.perf_counter()-t_loop:.2f} s')
 
-        delta_u = np.linalg.norm(u_new - u_old) / (np.linalg.norm(u_new) + 1e-12)
-        delta_w = np.linalg.norm(w_new - w_old) / (np.linalg.norm(w_new) + 1e-12)
-        print(f'    Δu_rel = {delta_u:.2e},  Δw_rel = {delta_w:.2e}')
-        print(f'    u range = [{u_new.min():+.3e}, {u_new.max():+.3e}],  '
-              f'w range = [{w_new.min():+.3e}, {w_new.max():+.3e}]')
-        u_old, gu_old, w_old, gw_old = u_new, gu_new, w_new, gw_new
-    print(f'[GS]  wall: {time.perf_counter()-t_loop:.2f} s')
-
-    # ----- predict on test grid -----
+    # ----- predict on test grid (dense kernel evaluation) -----
     print('\n[extend] predict (u, w) on an 80² test grid …')
     t0 = time.perf_counter()
     N_test = 80
@@ -486,15 +463,44 @@ def main(argv=None):
     XX, YY = np.meshgrid(xs, xs)
     X_test = np.stack([XX.ravel(), YY.ravel()], axis=1)
     Nt = X_test.shape[0]
+
+    w0 = z[0:N]; w1 = z[N:2*N]; w2 = z[2*N:3*N]
+    v0 = z[3*N:4*N]; v1 = z[4*N:5*N]; v2 = z[5*N:6*N]
+    v3 = -v1 * w1 - v2 * w2 - rhs_f * np.exp(-w0)
+    sol_u = np.concatenate([v1, v2, v3, v0, bdy_g])         # (4N+Nb,)
+    sol_w = np.concatenate([w1, w2, w0])                    # (3N,)
+
+    # Dense kernel(test, train) for the post-GN extension. Same as
+    # darcy_inverse.py's extend_sol — the price is one Nt × Ntrain dense
+    # evaluation outside the GN loop, which is fine.
+    from kolesky.measurements import (
+        LaplaceGradDiracPointMeasurement, stack_measurements,
+    )
     test_meas = _lgd(X_test, np.zeros(Nt), np.zeros((Nt, 2)), np.ones(Nt))
-    K_u_test = np.asarray(kernel(test_meas, last_train_u), dtype=np.float64)
-    K_w_test = np.asarray(kernel(test_meas, last_train_w), dtype=np.float64)
-    u_pred = K_u_test @ last_alpha_u
-    w_pred = K_w_test @ last_alpha_w
+    train_meas_u = stack_measurements([
+        _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N)),
+        _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N)),
+        _lgd(X_dom, np.ones(N),  np.zeros((N, 2)),            np.zeros(N)),
+        _lgd(X_dom, np.zeros(N), np.zeros((N, 2)),            np.ones(N)),
+        _lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)),          np.ones(Nb)),
+    ])
+    train_meas_w = stack_measurements([
+        _lgd(X_dom, np.zeros(N), np.tile([1.0, 0.0], (N, 1)), np.zeros(N)),
+        _lgd(X_dom, np.zeros(N), np.tile([0.0, 1.0], (N, 1)), np.zeros(N)),
+        _lgd(X_dom, np.zeros(N), np.zeros((N, 2)),            np.ones(N)),
+    ])
+    Theta_u_test = np.asarray(kernel(test_meas, train_meas_u), dtype=np.float64)
+    Theta_w_test = np.asarray(kernel(test_meas, train_meas_w), dtype=np.float64)
+
+    # alpha_u = Theta_u⁻¹ sol_u  via sparse factor matvec.
+    alpha_u = sf_u.apply(sol_u)
+    alpha_w = sf_w.apply(np.concatenate([np.zeros(1), sol_w]))[1:]   # drop dummy bdy slot
+
+    u_pred = Theta_u_test @ alpha_u
+    w_pred = Theta_w_test @ alpha_w
     a_pred = np.exp(w_pred)
     print(f'[extend] wall: {time.perf_counter()-t0:.2f} s')
 
-    # ----- accuracy -----
     a_truth_grid = a_truth(XX.ravel(), YY.ravel())
     u_truth_test = interp(X_test)
     L2_u = float(np.sqrt(np.mean((u_pred - u_truth_test) ** 2)))
@@ -529,9 +535,9 @@ def main(argv=None):
     for ax in axes.flat:
         ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$'); ax.set_aspect('equal')
     fig.suptitle(
-        f'Darcy inverse — alternating u/w with Algorithm 4.1 noisy ichol on u-step  '
-        f'(N_dom={N}, N_data={Nd}, σ={args.noise}, ρ={args.rho})',
-        fontsize=11,
+        f'Darcy inverse — joint GN with sparse Cholesky  '
+        f'(N_dom={N}, N_data={Nd}, ρ={args.rho}, σ={args.noise})',
+        fontsize=12,
     )
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
