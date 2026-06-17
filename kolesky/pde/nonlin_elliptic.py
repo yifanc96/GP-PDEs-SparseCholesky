@@ -88,7 +88,7 @@ def solve_nonlin_elliptic(
     sol_init: np.ndarray,
     nugget: float = 1e-10,
     GN_steps: int = 3,
-    rho_big: float = 4.0,
+    rho_big: float = 3.0,
     rho_small: float = 6.0,
     k_neighbors: int = 4,
     lambda_: float = 1.5,

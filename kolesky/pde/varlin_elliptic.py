@@ -6,8 +6,10 @@ u = bdy  on ∂Ω
 Dimension-agnostic: the Δ∇δ measurement (Laplacian + gradient + Dirac)
 generalizes naturally since the gradient weight is a `d`-vector, and
 the maximin ordering / sparsity pattern use Euclidean distance in any
-`d`. The big factor uses the DiracsFirstThenUnifScale ordering rather
-than FollowDiracs. Mirrors main_VarLinElliptic2d.jl.
+`d`. The big factor uses the FollowDiracs ordering (each per-point
+derivative inserted right after its δ in the maximin order) so that
+matching δ + derivative measurements share a supernode — this is what
+gives an accurate sparse factor at ρ=3. Mirrors main_VarLinElliptic2d.jl.
 """
 
 from __future__ import annotations
@@ -159,10 +161,10 @@ def solve_var_lin_elliptic(
             print(msg)
 
     # --- big factor (fixed spatial operator -∇·(a∇), no reaction term) ---
-    log('[big factor] DiracsFirstThenUnifScale ordering + sparsity …')
+    log('[big factor] FollowDiracs ordering + sparsity …')
     t0 = time.perf_counter()
     meas_big = _make_measurements_big(X_boundary, X_domain, lap_coefs, grad_coefs)
-    implicit_big = ImplicitKLFactorization.build_diracs_first_then_unif_scale(
+    implicit_big = ImplicitKLFactorization.build_follow_diracs(
         kernel, meas_big, rho_big, k_neighbors=k_neighbors,
         lambda_=lambda_, alpha=alpha,
     )

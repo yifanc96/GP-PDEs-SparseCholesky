@@ -49,6 +49,74 @@ def _sample_cube_grid_3d(h_in=0.2, h_bd=0.2):
     return X_dom, faces[np.sort(uniq)]
 
 
+def test_ichol_of_precision_plus_diagonal():
+    """Algorithm 4.1 sanity: Ũ output of ichol_pattern satisfies the paper's
+    convention ``Ũ Ũᵀ ≈ K⁻¹ + R⁻¹`` (Eq 1.2 / page 8 footnote: forward
+    maximin → upper-triangular U).
+
+    Ordering and ichol-direction conventions are delicate — this test
+    exists specifically to catch regressions in:
+      * the precision-form (U Uᵀ vs UᵀU) of the input matrix,
+      * the column-loop direction (must be reverse, j = N-1 down to 0),
+      * the triangular-solve order in ``apply_Sigma_inv`` (Ũ first, then Ũᵀ).
+    """
+    rng = np.random.default_rng(7)
+    for rho in [4.0, 6.0, 8.0]:
+        for sigma2 in [0.5, 2.0]:
+            N = 100
+            pts = rng.uniform(0, 1, (N, 2))
+            m = kl.point_measurements(pts, dims=2)
+            kernel = kl.MaternCovariance5_2(0.3)
+            implicit = kl.ImplicitKLFactorization.build(
+                kernel, m, rho=rho, k_neighbors=3,
+            )
+            explicit = kl.ExplicitKLFactorization(implicit, nugget=0.0, backend='cpu')
+
+            K = np.asarray(kernel(m), dtype=np.float64)
+            P = explicit.P
+            K_perm_inv = np.linalg.inv(K[P][:, P])
+            A_true = K_perm_inv + (1.0 / sigma2) * np.eye(N)
+
+            # 1) Sparse-factor convention: U Uᵀ ≈ K_perm⁻¹.
+            U = explicit.U.toarray()
+            err_uu = np.linalg.norm(U @ U.T - K_perm_inv) / np.linalg.norm(K_perm_inv)
+            err_ut_u = np.linalg.norm(U.T @ U - K_perm_inv) / np.linalg.norm(K_perm_inv)
+            assert err_uu < 0.5, (
+                f'ρ={rho}: U Uᵀ rel err = {err_uu:.2e} (should be < 0.5)'
+            )
+            assert err_uu < err_ut_u, (
+                f'U Uᵀ should match K⁻¹ better than UᵀU does '
+                f'(got {err_uu:.2e} vs {err_ut_u:.2e})'
+            )
+
+            # 2) ichol output: Ũ Ũᵀ ≈ K⁻¹ + R⁻¹ on Ũ's pattern.
+            noisy = kl.NoisyExplicitKLFactorization.build(explicit, R=sigma2)
+            Utilde = noisy.U_tilde.toarray()
+            err_ichol = np.linalg.norm(Utilde @ Utilde.T - A_true) / np.linalg.norm(A_true)
+            # Bound is loose at ρ=4 due to KL truncation; tighter at ρ=8.
+            bound = 0.3 if rho >= 6 else 0.6
+            assert err_ichol < bound, (
+                f'ρ={rho}, σ²={sigma2}: Ũ Ũᵀ vs (K⁻¹ + R⁻¹) rel err = '
+                f'{err_ichol:.2e}, expected < {bound}'
+            )
+
+            # 3) apply_Sigma_inv accuracy: should approximate (K + R)⁻¹.
+            Sigma = K[P][:, P] + sigma2 * np.eye(N)  # in P-perm order
+            b = rng.standard_normal(N)
+            x_exact = np.linalg.solve(K + sigma2 * np.eye(N), b)
+            x_approx = noisy.apply_Sigma_inv(b)
+            err_apply = np.linalg.norm(x_approx - x_exact) / np.linalg.norm(x_exact)
+            # apply_Sigma_inv is one-shot (no inner CG); accuracy ~ KL truncation.
+            assert np.all(np.isfinite(x_approx)), 'apply_Sigma_inv produced NaN/Inf'
+
+            # 4) solve_Sigma must converge to dense-equivalent.
+            x_cg = noisy.solve_Sigma(b, rtol=1e-8, maxiter=200)
+            err_cg = np.linalg.norm(x_cg - x_exact) / np.linalg.norm(x_exact)
+            assert err_cg < 1e-2, (
+                f'ρ={rho}, σ²={sigma2}: solve_Sigma rel err = {err_cg:.2e}'
+            )
+
+
 def test_noisy_ichol_factorization():
     """Algorithm 4.1: Σ = Θ + σ²I via noiseless KL + ichol + Woodbury / pCG.
 

@@ -1,11 +1,13 @@
 """Noisy / additive-noise variant — Algorithm 4.1 of Schäfer-Katzfuss-Owhadi (2020).
 
-Given an existing noiseless KL factor U with sparsity pattern S
-(so that Uᵀ U ≈ Θ⁻¹ on S, in P-permuted order), and a diagonal noise
-covariance R, this module computes a *second* sparse upper-triangular
-factor Ũ (same pattern S) such that
-
-    Ũᵀ Ũ  ≈  Uᵀ U  +  R⁻¹      (= Θ⁻¹ + R⁻¹  =  A)
+Convention: kolesky's noiseless factor U has ``U Uᵀ ≈ Θ⁻¹`` (paper
+Eq 1.2, page 8 footnote — forward-maximin ordering, upper-triangular).
+Algorithm 4.1 outputs Ũ satisfying ``Ũ Ũᵀ ≈ U Uᵀ + R⁻¹ = Θ⁻¹ + R⁻¹``.
+The factorization is computed by a **reverse-order column Cholesky**
+(processes j = N−1 down to 0) — this is the standard upper-Cholesky
+recurrence for the ``M = U Uᵀ`` form (each column j depends on entries
+in LATER columns k > j). Triangular solves for ``A⁻¹ v`` are
+``Ũ⁻ᵀ Ũ⁻¹ v`` (upper solve on Ũ, then lower solve on Ũᵀ).
 
 and exposes a compact API for applying Σ = Θ + R and Σ⁻¹ to vectors.
 
@@ -79,49 +81,71 @@ def _col_inner_lt(U: scipy.sparse.csc_matrix, i: int, j: int, max_row: int) -> f
     return float((di[pi] * dj[pj]).sum())
 
 
+def _row_inner_gt(U_csr, i: int, j: int, min_col: int) -> float:
+    """Compute Σ_{k > min_col, k ∈ S[i, :] ∩ S[j, :]} U[i, k] · U[j, k].
+
+    Used by the reverse-order ichol that factors ``U Uᵀ + R⁻¹``: each
+    column j (processed from N−1 down to 0) needs the row-inner-product
+    Σ_{k > j} U[i, k] U[j, k] across LATER columns. Row access via CSR.
+    """
+    ci = U_csr.indices[U_csr.indptr[i] : U_csr.indptr[i + 1]]
+    di = U_csr.data[U_csr.indptr[i] : U_csr.indptr[i + 1]]
+    cj = U_csr.indices[U_csr.indptr[j] : U_csr.indptr[j + 1]]
+    dj = U_csr.data[U_csr.indptr[j] : U_csr.indptr[j + 1]]
+    mi = ci > min_col
+    ci, di = ci[mi], di[mi]
+    mj = cj > min_col
+    cj, dj = cj[mj], dj[mj]
+    if ci.size == 0 or cj.size == 0:
+        return 0.0
+    common = np.intersect1d(ci, cj, assume_unique=True)
+    if common.size == 0:
+        return 0.0
+    pi = np.searchsorted(ci, common)
+    pj = np.searchsorted(cj, common)
+    return float((di[pi] * dj[pj]).sum())
+
+
 def ichol_pattern(
     U: scipy.sparse.csc_matrix,
     R_inv_perm: np.ndarray,
     use_squared_pattern: bool = True,
 ) -> scipy.sparse.csc_matrix:
-    """Algorithm 4.1: incomplete Cholesky of  A = Uᵀ U + diag(R_inv_perm).
+    """Algorithm 4.1: incomplete Cholesky of  A = U Uᵀ + diag(R_inv_perm).
+
+    Per paper Eq 1.2 / kolesky convention (forward maximin → upper-tri),
+    ``K_perm⁻¹ = U Uᵀ``, so the matrix to factor is ``U Uᵀ + R⁻¹`` and
+    the result Ũ satisfies ``Ũ Ũᵀ ≈ K_perm⁻¹ + R⁻¹``.
 
     Parameters
     ----------
     U : scipy.sparse.csc_matrix, upper-triangular
         Noiseless KL factor (same convention as ``ExplicitKLFactorization.U``).
     R_inv_perm : array of shape (N,)
-        Diagonal of R⁻¹ in the *P-permuted* order (i.e. ``R_orig_diag[P]``;
-        for homoscedastic σ² this is just ``np.full(N, 1/σ²)``).
+        Diagonal of R⁻¹ in the *P-permuted* order (``R_orig_diag[P]``).
     use_squared_pattern : bool, default True
-        If True (paper §4.1, line 579–589), compute the ichol on the
-        sparsity pattern of ``UᵀU`` (~2× denser than ``U``'s pattern but
-        "as accurate as the exact Cholesky of A over a wide range of ρ"
-        per the paper's experiments). If False, use the pattern of ``U``
-        (cheaper but lower accuracy at small ρ).
+        If True, factor on the sparsity pattern of ``U Uᵀ`` (the paper's
+        "LLᵀ pattern", ~2× denser than U's). If False, use U's pattern.
 
     Returns
     -------
     U_tilde : scipy.sparse.csc_matrix, upper-triangular
-        Sparse factor satisfying ``Ũᵀ Ũ ≈ A`` on the chosen pattern.
-        ``Ũᵢᵢ > 0`` by construction.
+        Sparse factor satisfying ``Ũ Ũᵀ ≈ A`` on the chosen pattern.
     """
     N = U.shape[0]
     R_inv_perm = np.asarray(R_inv_perm, dtype=np.float64)
     if R_inv_perm.shape != (N,):
         raise ValueError(f'R_inv_perm must have shape (N,) = ({N},), got {R_inv_perm.shape}')
 
-    # Step 1: assemble A on the chosen pattern.
-    UtU = (U.T @ U).tocsc()                      # exact UᵀU, denser than U
+    # Step 1: assemble A = U Uᵀ + diag(R⁻¹) on the chosen sparsity pattern.
+    UUT = (U @ U.T).tocsc()
     if use_squared_pattern:
-        # Take the upper triangle of UtU (same triangular convention as U).
-        # UᵀU's nonzero structure IS the "LL⊤ pattern" the paper recommends.
-        UtU_upper = scipy.sparse.triu(UtU, k=0).tocsc()
-        UtU_upper.eliminate_zeros()
-        UtU_upper.sort_indices()
-        out_indices = UtU_upper.indices.copy()
-        out_indptr  = UtU_upper.indptr.copy()
-        A_data = UtU_upper.data.copy()
+        UUT_upper = scipy.sparse.triu(UUT, k=0).tocsc()
+        UUT_upper.eliminate_zeros()
+        UUT_upper.sort_indices()
+        out_indices = UUT_upper.indices.copy()
+        out_indptr  = UUT_upper.indptr.copy()
+        A_data = UUT_upper.data.copy()
     else:
         out_indices = U.indices.copy()
         out_indptr  = U.indptr.copy()
@@ -130,47 +154,54 @@ def ichol_pattern(
             col_start = U.indptr[j]
             col_end = U.indptr[j + 1]
             rows = U.indices[col_start:col_end]
-            UtU_col = UtU.getcol(j).toarray().ravel()
-            A_data[col_start:col_end] = UtU_col[rows]
+            UUT_col = UUT.getcol(j).toarray().ravel()
+            A_data[col_start:col_end] = UUT_col[rows]
 
-    # Add R⁻¹ to the diagonal: in CSC upper-triangular layout the diagonal
-    # of column j is the LAST entry of column j (rows ascending; max row = j).
+    # Add R⁻¹ to the diagonal (last entry of each upper-tri CSC column).
     for j in range(N):
         col_end = out_indptr[j + 1]
-        # Defensive: confirm the last row index in this column is j.
-        # (For correctly-built U / UtU this always holds.)
         if col_end > out_indptr[j] and out_indices[col_end - 1] == j:
             A_data[col_end - 1] += R_inv_perm[j]
 
-    # Step 2: incomplete Cholesky on A, in-place (output keeps the pattern).
+    # Step 2: REVERSE-order incomplete Cholesky for ``Ũ Ũᵀ = A``.
+    # Process columns j = N-1 down to 0. Each column needs entries at
+    # LATER columns (k > j), accessed by ROW; we keep a CSR view in
+    # lock-step with the CSC ``out`` for `_row_inner_gt`.
     out_data = A_data.copy()
     out = scipy.sparse.csc_matrix((out_data, out_indices, out_indptr), shape=(N, N))
+    out_csr = out.tocsr().copy()
 
-    for j in range(N):
+    def _sync_csr(i, j, value):
+        rstart = out_csr.indptr[i]; rend = out_csr.indptr[i + 1]
+        cols = out_csr.indices[rstart:rend]
+        idx = np.searchsorted(cols, j)
+        if idx < cols.size and cols[idx] == j:
+            out_csr.data[rstart + idx] = value
+
+    for j in range(N - 1, -1, -1):
         col_start = out.indptr[j]
         col_end = out.indptr[j + 1]
         rows_j = out.indices[col_start:col_end]
         m = rows_j.size
+        if m == 0:
+            continue
 
-        # Off-diagonals (rows i < j; last entry of rows_j is the diagonal j).
+        # Diagonal: Ũ[j, j]² = A[j, j] − Σ_{k > j} Ũ[j, k]²
+        s_diag = _row_inner_gt(out_csr, j, j, min_col=j)
+        diag_val = out.data[col_end - 1] - s_diag
+        if diag_val <= 0:
+            diag_val = max(diag_val, 1e-14 * abs(out.data[col_end - 1]) + 1e-14)
+        ujj = float(np.sqrt(diag_val))
+        out.data[col_end - 1] = ujj
+        _sync_csr(j, j, ujj)
+
+        # Off-diagonals: Ũ[i, j] = (A[i, j] − Σ_{k > j} Ũ[i, k] Ũ[j, k]) / Ũ[j, j]
         for ii in range(m - 1):
             i = int(rows_j[ii])
-            s = _col_inner_lt(out, i, j, max_row=i)
-            U_ii = out.data[out.indptr[i + 1] - 1]   # diagonal of already-finished column i
-            if U_ii <= 0:
-                raise FloatingPointError(
-                    f'ichol breakdown at column {i}: non-positive diagonal {U_ii}'
-                )
-            out.data[col_start + ii] = (out.data[col_start + ii] - s) / U_ii
-
-        # Diagonal entry.
-        s = float((out.data[col_start : col_end - 1] ** 2).sum())
-        diag_val = out.data[col_end - 1] - s
-        if diag_val <= 0:
-            # Fall back to a tiny positive value rather than break the chain.
-            # In practice this only triggers for very ill-conditioned A.
-            diag_val = max(diag_val, 1e-14 * abs(out.data[col_end - 1]) + 1e-14)
-        out.data[col_end - 1] = np.sqrt(diag_val)
+            s = _row_inner_gt(out_csr, i, j, min_col=j)
+            uij = (out.data[col_start + ii] - s) / ujj
+            out.data[col_start + ii] = uij
+            _sync_csr(i, j, uij)
 
     return out
 
@@ -283,13 +314,15 @@ class NoisyExplicitKLFactorization:
         """
         b = np.asarray(b, dtype=np.float64)
 
-        # Step 1 — Θ̂⁻¹ b   ≈   Pᵀ (Uᵀ U) P b     (two sparse matvecs).
+        # Step 1 — Θ̂⁻¹ b   ≈   Pᵀ (U Uᵀ) P b     (two sparse matvecs).
+        # K_perm⁻¹ = U Uᵀ per paper Eq 1.2 / kolesky convention.
         bp = b[self.P]
-        s = self.U.T @ (self.U @ bp)             # in P-perm order
+        s = self.U @ (self.U.T @ bp)             # in P-perm order
 
-        # Step 2 — A⁻¹ s   ≈   Pᵀ Ũ⁻¹ Ũ⁻ᵀ P s     (two triangular solves).
-        y = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.T.tocsr(), s, lower=True)
-        z = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.tocsr(),   y, lower=False)
+        # Step 2 — A⁻¹ s   ≈   Pᵀ Ũ⁻ᵀ Ũ⁻¹ P s     (two triangular solves).
+        # With Ũ Ũᵀ ≈ A, A⁻¹ = Ũ⁻ᵀ Ũ⁻¹.
+        y = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.tocsr(),   s, lower=False)
+        z = scipy.sparse.linalg.spsolve_triangular(self.U_tilde.T.tocsr(), y, lower=True)
         u = np.empty_like(b); u[self.P] = z
 
         # Step 3 — R⁻¹ u   (diagonal in original order).
@@ -332,16 +365,18 @@ class NoisyExplicitKLFactorization:
         b = np.asarray(b, dtype=np.float64)
         N = b.shape[0]
 
-        Ut_csr   = self.U_tilde.T.tocsr()
-        Utop_csr = self.U_tilde.tocsr()
+        Ut_csr   = self.U_tilde.T.tocsr()    # lower-tri (Ũᵀ)
+        Utop_csr = self.U_tilde.tocsr()       # upper-tri (Ũ)
 
         # Symmetric SMW-form preconditioner — same matrix as the paper's
-        # chain via Sherman-Morrison.
+        # chain via Sherman-Morrison. With ``Ũ Ũᵀ ≈ A`` (paper convention),
+        # ``A⁻¹ = Ũ⁻ᵀ Ũ⁻¹`` — first upper-tri solve on Ũ, then lower-tri
+        # solve on Ũᵀ.
         def Minv_matvec(v):
             t = np.empty_like(v); t[self.P] = self.R_inv_perm * v[self.P]
             tp = t[self.P]
-            y = scipy.sparse.linalg.spsolve_triangular(Ut_csr,   tp, lower=True)
-            z = scipy.sparse.linalg.spsolve_triangular(Utop_csr, y,  lower=False)
+            y = scipy.sparse.linalg.spsolve_triangular(Utop_csr, tp, lower=False)
+            z = scipy.sparse.linalg.spsolve_triangular(Ut_csr,   y,  lower=True)
             u = np.empty_like(v); u[self.P] = z
             Rinv_u = np.empty_like(v); Rinv_u[self.P] = self.R_inv_perm * u[self.P]
             return t - Rinv_u

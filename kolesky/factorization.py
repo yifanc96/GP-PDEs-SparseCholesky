@@ -708,6 +708,24 @@ class ImplicitKLFactorization:
         BUT the remaining sets are concatenated *after* the δ_int block
         (instead of interleaved per-point). Length-scales for the repeated
         blocks use the smallest ℓ seen in the 2-set ordering.
+
+        **Theoretical note / when to use this vs. ``build_follow_diracs``.**
+        DiracsFirstThenUnifScale is theoretically correct and produces a
+        sparser factor (no per-point feature blowup of supernodes), but it
+        breaks the per-point coupling between matching ``δ`` and derivative
+        measurements: ``δ_k`` and ``∂_k`` end up in completely disjoint
+        parts of the ordering, with the derivative block forced onto the
+        smallest ℓ. To represent the strong on-point correlation between a
+        function value and its derivatives, the factorization must then
+        rely on long-range supernode interactions — which the truncated
+        sparsity pattern does not capture, so accuracy is poor at small ρ.
+
+        Empirically, getting the same KL-truncation accuracy as
+        ``build_follow_diracs`` requires a **significantly larger ρ** —
+        often 2–3× — losing the storage advantage. For derivative-rich
+        kernels (``LaplaceDirac``, ``LaplaceGradDirac``, ``HessianDirac``)
+        prefer ``build_follow_diracs``, which keeps each spatial point's
+        feature group in a single supernode and is accurate at ρ=3-4.
         """
         import warnings
 
@@ -771,7 +789,9 @@ class ImplicitKLFactorization:
         alpha: float = 1.0,
     ) -> 'ImplicitKLFactorization':
         """FollowDiracs ordering (matches Julia's
-        ImplicitKLFactorization_FollowDiracs).
+        ImplicitKLFactorization_FollowDiracs). **Recommended default for
+        derivative-rich measurements** (``LaplaceDirac``, ``LaplaceGradDirac``,
+        ``HessianDirac``); accurate at ρ=3 in 2D.
 
         `measurements` must be a list of `lm >= 3` groups, all of the same
         measurement type:
@@ -785,6 +805,14 @@ class ImplicitKLFactorization:
         are inserted immediately after its δ index in the ordering — so
         matching δ / derivative pairs end up in the same supernode, which
         is what the paper relies on for accuracy.
+
+        **Cost.** Supernode size grows by ``n_dom_sets`` (= 1 + #derivative
+        groups) since each spatial point now contributes that many
+        measurements to a single supernode. Asymptotic nnz =
+        ``O(N · ρ²ᵈ · n_dom_sets²)``. For ``LaplaceGradDirac`` in 2D
+        (``n_dom_sets = 4``) this is 16× denser than what a "δ-only" factor
+        would have, but **necessary** for the on-point feature-coupling to
+        be representable by the sparse pattern.
         """
         if not isinstance(measurements, (list, tuple)) or len(measurements) < 3:
             raise ValueError('build_follow_diracs expects a list of 3+ measurement groups')

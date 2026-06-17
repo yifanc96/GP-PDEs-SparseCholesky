@@ -1,0 +1,649 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+
+% ---- macros -------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\T}{^{\!\top}}
+\newcommand{\inv}{^{-1}}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cGP}{\mathcal{GP}}
+\newcommand{\Omegabd}{\partial\Omega}
+\newcommand{\Th}{\Theta}
+\newcommand{\Thtr}{\Th_{\mathrm{train}}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\Ed}{E_d}
+\newcommand{\Lw}{\mathcal{L}_{\bar w}}
+\newcommand{\bigO}{\mathcal{O}}
+
+\title{A near-linear sparse-Cholesky solver for the Darcy inverse problem}
+\author{Working note}
+\date{\today}
+
+\emergencystretch=3em
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We give a Gaussian-process / PDE-collocation solver for the Darcy inverse
+problem --- recover both the diffusion coefficient $a=e^{w}$ and the state $u$
+from a forcing, boundary data, and noisy interior measurements of $u$ --- whose
+total cost grows essentially \emph{linearly} in the number of collocation points
+$N$, matching the efficiency of a single forward elliptic solve up to a small
+constant factor (we solve for two unknown fields rather than one). The solver
+uses two ingredients, both built only from the near-linear primitives supplied
+by an incomplete sparse-Cholesky (Kullback--Leibler, ``KL'') factorization of
+the \emph{covariance} matrices of two \emph{independent} priors $K_u$ (for $u$)
+and $K_w$ (for $w$); the two kernels are never summed and the precision Hessian
+is never assembled. (i) An \emph{alternating refinement} stage in which each
+half-step is a linear GP regression. The hard half --- the $u$-update with noisy
+interior data co-located on the PDE collocation points --- is solved by a direct
+\emph{bordered / Schur} solve whose only non-forward ingredient, the data-block
+posterior covariance, is read off in closed form (and in near-linear time) from
+the trailing block of the joint screened precision factor. (ii) A
+\emph{warm-up} stage that finds the basin of the (non-convex) MAP problem by
+running a few joint Gauss--Newton steps on a \emph{fixed coarse subset} of the
+points and then kriging the recovered coefficient field onto all $N$ points; its
+cost is $\bigO(1)$ in the fine $N$. We report controlled scaling experiments
+from $N=800$ to $N=12800$ showing a flat per-stage profile and an
+overall empirical exponent $\approx 1$, with coefficient-recovery error that is
+robust in $N$.
+\end{abstract}
+
+\tableofcontents
+
+% =========================================================================
+\section{Problem and scope}\label{sec:problem}
+% =========================================================================
+
+We consider the Darcy (steady diffusion) inverse problem on $\Omega=[0,1]^2$:
+recover the diffusion coefficient $a(x)=e^{w(x)}>0$ and the state $u(x)$ from
+\begin{equation}\label{eq:darcy}
+\begin{aligned}
+-\nabla\!\cdot\!\bigl(e^{w(x)}\nabla u(x)\bigr) &= f(x), && x\in\Omega,\\
+u(x) &= g(x), && x\in\Omegabd,\\
+y_j &= u(x_j^{d}) + \eta_j, && \eta_j\sim\cN(0,\sigma^2),\ \ j=1,\dots,N_d.
+\end{aligned}
+\end{equation}
+The forcing $f$, boundary data $g$, observation sites $x_j^d$, observations
+$y_j$, and noise level $\sigma\ge 0$ are given. We parameterize $a=e^w$ so that
+positivity is automatic and $w=\log a$ is unconstrained. Expanding the
+divergence,
+\begin{equation}\label{eq:pde-expanded}
+-e^{w}\bigl(\Delta u + \partial_1 w\,\partial_1 u + \partial_2 w\,\partial_2 u\bigr)=f
+\quad\Longleftrightarrow\quad
+\Delta u = -\,\partial_1 w\,\partial_1 u - \partial_2 w\,\partial_2 u - f\,e^{-w}.
+\end{equation}
+
+\paragraph{Test problem.} Throughout we use $f\equiv 1$, $g\equiv 0$, and the
+two-peak truth
+\begin{equation}
+a_\star(x) = e^{\sin 2\pi x_1+\sin 2\pi x_2}
+           + e^{-(\sin 2\pi x_1+\sin 2\pi x_2)}
+         = 2\cosh\!\bigl(\sin 2\pi x_1+\sin 2\pi x_2\bigr),
+\end{equation}
+i.e.\ $w_\star=\log a_\star$. The reference state $u_\star$ is produced by a
+fine finite-difference forward solve; data $y_j$ are $u_\star$ sampled at $N_d$
+interior points plus Gaussian noise of level $\sigma=10^{-3}$. Recovering the
+two peaks of $a_\star$ is the qualitative success criterion.
+
+\paragraph{Goal.} Solve \eqref{eq:darcy} with a cost that is \emph{near-linear}
+in $N$ --- the same complexity class as solving a single (forward) elliptic
+equation with the sparse-Cholesky machinery --- allowing only a constant-factor
+overhead for the second unknown field. We restrict ourselves to the primitives
+of the KL sparse-Cholesky factorization and explicitly \emph{exclude} external
+fast methods (multigrid, nested dissection, FMM, $H$-matrices). The central
+difficulty, as in the forward problem, is to solve the arising linear systems
+with good (screening) preconditioners.
+
+% =========================================================================
+\section{GP collocation and the sparse-Cholesky primitives}\label{sec:gp}
+% =========================================================================
+
+\subsection{Latent fields, functionals, and the MAP problem}
+
+We place \emph{independent} mean-zero Gaussian-process priors
+$u\sim\cGP(0,K_u)$ and $w\sim\cGP(0,K_w)$, both with Mat\'ern-$7/2$ kernels but
+with different length scales: a long $\ell_u=1.0$ (the state solves an elliptic
+PDE and is smooth, so its derivatives $\nabla u,\Delta u$ --- which pin $a$
+through \eqref{eq:pde-expanded} --- must be clean) and a short $\ell_w=0.2$ (the
+coefficient has sharp peaks and the $w$-factor must stay local/sparse). Using a
+single shared, short length scale flattens the recovered $a$; this length-scale
+split is essential for two-mode recovery.
+
+We discretize each field by its \emph{jet} at $N$ interior collocation points
+$\{x_i\}_{i=1}^N\subset\Omega$ and the boundary points
+$\{x_i^\partial\}_{i=1}^{N_\partial}$. Collect the unknowns
+\begin{equation}
+z = \bigl(\,\underbrace{w,\,\partial_1 w,\,\partial_2 w}_{w\text{-jet}},\;
+            \underbrace{u,\,\partial_1 u,\,\partial_2 u}_{u\text{-jet}}\,\bigr)\in\R^{6N},
+\end{equation}
+evaluated at the $x_i$ (the Laplacian $\Delta u$ is \emph{not} a free unknown:
+it is eliminated pointwise through the PDE, see \eqref{eq:v3} below). Each field
+is represented in the GP by a family of linear functionals --- point value
+$\delta_x$, first derivatives $\partial_1,\partial_2$, and Laplacian $\Delta$
+--- applied at the collocation/boundary points. For a stacked set of $M$ such
+functionals $L=(L_1,\dots,L_M)$ the prior Gram matrix is
+$\Theta = \bigl(\mathrm{Cov}[L_a\phi,\,L_b\phi]\bigr)_{a,b}=\bigl(L_a L_b
+K\bigr)_{a,b}$, a single-kernel covariance.
+
+The MAP estimate minimizes the sum of the two prior RKHS norms and the data
+misfit, subject to the boundary condition and the (nonlinear) PDE link. Writing
+$v$ for the vector of $u$-functional values implied by $z$ and $w$ for the
+vector of $w$-functional values, and using that for a GP the RKHS norm of a
+function interpolating values $\xi$ on functionals $L$ equals $\xi\T\Theta\inv
+\xi$, the objective is
+\begin{equation}\label{eq:loss}
+J(z) \;=\; v\T \Th_u\inv v \;+\; w\T \Th_w\inv w
+        \;+\; \frac{1}{\sigma^2}\sum_{j=1}^{N_d}\bigl(u(x_j^d)-y_j\bigr)^2,
+\end{equation}
+where $\Th_u$ is the covariance of the $u$-functionals $\{\delta_\partial,
+\delta_\Omega,\partial_1,\partial_2,\Delta\}$ and $\Th_w$ that of the
+$w$-functionals $\{\delta_\Omega,\partial_1,\partial_2\}$. The boundary rows of
+$v$ are fixed to $g$, and the Laplacian rows are eliminated through the PDE
+\eqref{eq:pde-expanded}:
+\begin{equation}\label{eq:v3}
+(\Delta u)_i = -(\partial_1 u)_i (\partial_1 w)_i
+              -(\partial_2 u)_i (\partial_2 w)_i - f_i\, e^{-w_i}.
+\end{equation}
+\textbf{The two priors enter \eqref{eq:loss} as two separate quadratic forms;
+$K_u$ and $K_w$ are never added.} This is what keeps each Gram matrix a
+single-kernel covariance that the screening theory can factor.
+
+\subsection{The sparse-Cholesky primitive}\label{sec:kl}
+
+The Schäfer--Sullivan--Owhadi screening theory shows that, in a fine-to-coarse
+\emph{maximin} ordering and with a sparsity radius $\rho$ (keep, for each point,
+the $\bigO(\rho^d)$ nearest already-ordered points), the Cholesky factor $U$ of
+the \emph{inverse} covariance is exponentially accurate when truncated to that
+sparsity pattern. The KL factorization returns a sparse upper-triangular $U$ and
+a permutation $P$ with
+\begin{equation}\label{eq:kl}
+\Theta\inv \;\approx\; P\T (U U\T) P ,
+\qquad \mathrm{nnz}(U)=\bigO(N\rho^d),
+\end{equation}
+both built in near-linear time. From \eqref{eq:kl} we get the only two linear
+primitives we will use, each near-linear:
+\begin{equation}\label{eq:prims}
+\begin{aligned}
+\Theta\inv x &\;=\; P\T U U\T P x &&(\text{two sparse mat-vecs}),\\
+\Theta x &\;=\; P\T U^{-\!\top} U\inv P x &&(\text{two sparse triangular solves}).
+\end{aligned}
+\end{equation}
+We build one such ``big'' factor for $\Th_u$ and one for $\Th_w$ once; the
+``small'' factors used as preconditioners below are rebuilt per linear solve but
+are themselves near-linear. We use $\rho=3$ throughout (the elliptic regime;
+the forward solver of the companion note is $N$-independent at this $\rho$).
+
+% =========================================================================
+\section{The solver}\label{sec:solver}
+% =========================================================================
+
+The objective \eqref{eq:loss} is non-convex (through \eqref{eq:v3}). The solver
+has two stages: a \emph{warm-up} that lands in the recovery basin
+(Sec.~\ref{sec:warmup}) and an \emph{alternating refinement} that converges to
+the MAP estimate (Sec.~\ref{sec:alt}). We describe the alternating stage first
+because the warm-up is engineered around it.
+
+\subsection{Alternating refinement}\label{sec:alt}
+
+With one field frozen, \eqref{eq:loss} is a \emph{linear} GP regression in the
+other. Each outer step performs a $u$-update then a $w$-update; both re-solve
+their field from scratch, so only a coefficient field $w$ in the right basin is
+needed to seed the stage.
+
+\paragraph{$w$-update (easy).} With $u$ fixed, \eqref{eq:pde-expanded} is linear
+in $w$ and the regression has a single functional family on $\Th_w$; it is small
+and well-conditioned, converging in $\bigO(10)$ preconditioned-CG (pCG)
+iterations with the $\Th_w$ small factor as preconditioner. It is never the
+bottleneck.
+
+\paragraph{$u$-update (the hard half).} Fix $w$ and write $\bar w_1=\partial_1
+w$, $\bar w_2=\partial_2 w$. The frozen PDE is the linear operator
+\begin{equation}
+\Lw u := \Delta u + \bar w_1\,\partial_1 u + \bar w_2\,\partial_2 u,
+\qquad \Lw u = -f e^{-\bar w} =: b^\Omega .
+\end{equation}
+The $u$-update is the posterior mean of $u\sim\cGP(0,K_u)$ under
+\begin{equation}\label{eq:uconstraints}
+\underbrace{u(x_i^\partial)=g_i}_{N_\partial},\qquad
+\underbrace{\Lw u(x_i^\Omega)=b_i^\Omega}_{N_\Omega=N},\qquad
+\underbrace{u(x_j^d)\approx y_j}_{N_d,\ \text{noise }\sigma}.
+\end{equation}
+In covariance (``$\alpha$-space'') form, with $\Thtr$ the Gram of these
+$N_\partial+N+N_d$ functionals and $R=\sigma^2$ on the data rows,
+\begin{equation}\label{eq:alpha}
+(\Thtr + R)\,\alpha = \begin{pmatrix}g\\ b^\Omega\\ y\end{pmatrix},
+\qquad
+u(x_*) = k(\delta_{x_*},\text{train})\,\alpha .
+\end{equation}
+
+\textbf{Why a plain preconditioner fails, and the fix.} Without data
+($N_d=0$) the system \eqref{eq:alpha} is exactly a forward elliptic solve: the
+$\Th_u$ small factor preconditions it to an $N$-independent iteration count
+($\sim 13$ at $\rho=3$ in our runs), reproducing the forward solver. The trouble
+is that the data sites are \emph{co-located} with PDE points
+($x_j^d=x_j^\Omega$) and $\sigma$ is tiny, so the data $\delta$-rows are nearly
+redundant with the PDE rows: their conditional variance given $\{$bdy,
+PDE$\}$ is $\approx\sigma^2 I$, a tight cluster of near-null Gram modes that a
+local screened factor of the \emph{full} augmented operator cannot resolve at
+$\rho\le 5$. (Raising $\rho$ patches one $N$ but the stiff-mode count grows
+$\propto N_d$.)
+
+The cure is to \emph{peel off} the small data block instead of preconditioning
+through it. Partition the functionals into the forward block
+$F=\{\text{bdy},\text{PDE}\}$ (which screens perfectly) and the data block
+$d=\{N_d$ noisy $\delta\}$. With
+$\Thtr=\begin{psmallmatrix}\Th_{FF}&\Th_{Fd}\\ \Th_{dF}&\Th_{dd}\end{psmallmatrix}$
+the block solve of \eqref{eq:alpha} is exact:
+\begin{equation}\label{eq:bordered}
+\begin{aligned}
+S &= S_0 + \sigma^2 I,\qquad S_0 = \Th_{dd} - \Th_{dF}\Th_{FF}\inv\Th_{Fd},\\
+\alpha_d &= S\inv\bigl(y - \Th_{dF}\Th_{FF}\inv\, \text{rhs}_F\bigr),\qquad
+\alpha_F = \Th_{FF}\inv\bigl(\text{rhs}_F - \Th_{Fd}\,\alpha_d\bigr).
+\end{aligned}
+\end{equation}
+Here $\Th_{FF}\inv$ is applied by the forward pCG ($N$-independent iterations,
+the $\Th_u$ small factor as preconditioner), $\Th_{Fd}\cdot$ and
+$\Th_{dF}\cdot$ are single mat-vecs of the big-factor operator, and $S$ is a
+small $N_d\times N_d$ dense system. The only delicate object is the data-block
+posterior covariance $S_0$; forming it by $N_d$ forward solves would cost
+$\bigO(N\cdot N_d)$. We avoid that entirely.
+
+\paragraph{Near-linear data-block covariance via the trailing precision block.}
+The block-inverse identity gives $S_0\inv=(\Thtr\inv)_{dd}$ exactly. The KL
+factor of the \emph{joint} screened system over $[\text{bdy},\text{PDE},
+\text{data}]$ already supplies $\Thtr\inv\approx P\T U U\T P$. Hence, with
+$a_j$ the position of data index $d_j$ under the permutation $P$ (i.e.\
+$a=P\inv[d]$),
+\begin{equation}\label{eq:trailing}
+(\Thtr\inv)_{d_i d_j} = (U U\T)_{a_i a_j} = U_{a_i,:}\,U_{a_j,:}\T,
+\qquad\Longrightarrow\qquad
+(\Thtr\inv)_{dd} = U_d\,U_d\T,
+\end{equation}
+where $U_d$ stacks the $N_d$ permuted data rows of $U$. So $S_0\inv$ is just the
+dense Gram of $N_d$ sparse rows of $U$ --- formed in $\bigO(\mathrm{nnz}(U_d))$
+time, \emph{no} forward solves. This is the key that turns the exact data-block
+handling from $\bigO(N^2)$ into near-linear (up to the $\bigO(N_d^2)$ dense $S$,
+discussed in Sec.~\ref{sec:complexity}). Numerically the screened $S_0$ carries
+one spurious large-variance mode; it is benign, merely down-weighting one data
+direction back to the accurate forward solve.
+
+\subsection{Warm-up by a coarse solve and kriging}\label{sec:warmup}
+
+The alternating stage converges only from inside the recovery basin: started
+from $w=0$ it sits at the trivial fixed point (the $u$-update at $w=0$ forces
+$\Delta u=-f$, killing the $w$-update's signal). A few \emph{joint}
+Gauss--Newton (GN) steps on \eqref{eq:loss} escape it. The GN Hessian is the
+precision/normal form
+\begin{equation}\label{eq:H}
+H = 2\,J_v\T \Th_u\inv J_v + 2\,J_w\T \Th_w\inv J_w + D,
+\end{equation}
+with $J_v,J_w$ the (sparse) Jacobians of the functional values w.r.t.\ $z$ and
+$D$ the data diagonal. \emph{Assembling and factoring $H$ is the original
+bottleneck.} The Jacobian sandwiching makes $H$ a squared (biharmonic-like)
+operator: its exact Cholesky fills in ($\bigO(N^{2.8})$ per step), and --- unlike
+the screened covariance precision of Sec.~\ref{sec:kl} --- its ill-conditioning
+($\kappa(H)\sim10^{9}$) is \emph{not} of a form any incomplete factorization can
+capture (no convergence at any $N$ or fill; we verify this in
+Sec.~\ref{sec:verif} and distil the rule as Insight~6). So instead of factoring
+$H$ we sidestep it.
+
+The key observation is that the warm-up's \emph{only} product that the
+alternating stage consumes is a coefficient field $w$ in the right basin
+(everything else is recomputed in \eqref{eq:bordered}). So:
+\begin{enumerate}[leftmargin=2em]
+\item Run the joint GN warm-up on a \emph{fixed coarse subset} of $N_c$
+  interior points (with $N_{d,c}$ coarse data points), at cost \emph{independent
+  of the fine $N$}. We use $N_c=400$, $N_{d,c}=150$, $6$ GN steps.
+\item Krige the coarse coefficient jet to all $N$ fine points. With $\alpha_w^c=
+  (\Th_w^c)\inv w^c$ the coarse dual weights (one application of the coarse $w$
+  factor), the fine field and its gradients are the GP posterior means
+  \begin{equation}
+  (w,\partial_1 w,\partial_2 w)(x_i)
+   = k\bigl(\{\delta,\partial_1,\partial_2\}_{x_i},\ \text{train}_w^c\bigr)\,\alpha_w^c,
+   \qquad i=1,\dots,N,
+  \end{equation}
+  one cross-covariance evaluation against the fixed coarse training set,
+  $\bigO(N)$.
+\end{enumerate}
+This is \emph{not} multigrid: there is a single coarse solve and one kriging
+evaluation, with no hierarchy, no cycles, and no restriction/prolongation
+operators. The resulting fine $w$-field seeds the alternating stage. (We also
+tested a ``data-first'' warm-up --- regress $u$ from data alone, then one
+$w$-update --- but its data-only Laplacian is too noisy to seed a good $w$ and
+it stalls; the coarse-solve warm-up is the method of choice.)
+
+% =========================================================================
+\section{Complexity}\label{sec:complexity}
+% =========================================================================
+
+Per-stage costs, with $\rho$ fixed and $N_d=\bigO(N)$:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Big factors} ($\Th_u,\Th_w$, built once): $\bigO(N\log N)$ build,
+  $\bigO(N)$ apply.
+\item \textbf{Warm-up:} coarse GN is $\bigO(1)$ in $N$; kriging is $\bigO(N)$.
+\item \textbf{Alternating, per outer step:} small-factor builds $\bigO(N\log
+  N)$; forward pCG $\bigO(N)\times(N\text{-independent iters})$; trailing-block
+  $S_0\inv$ extraction \eqref{eq:trailing} $\bigO(\mathrm{nnz}(U_d))=\bigO(N)$;
+  the dense $N_d\times N_d$ data solve $\bigO(N_d^2)$ to apply (a Cholesky
+  factorization $\bigO(N_d^3)$).
+\end{itemize}
+Every ingredient is near-linear except the dense data block. With
+$N_d\propto N$ that block is asymptotically $\bigO(N^2)$--$\bigO(N^3)$, but with
+a tiny constant: over the tested range it is sub-dominant and the measured
+profile is flat (Sec.~\ref{sec:results}). The known route to remove it ---
+screen $S$ itself, since the data sites are spatially distributed so $S_0$
+decays in space --- is left as future work; it does not affect the present
+near-linear measurements.
+
+% =========================================================================
+\section{Numerical results}\label{sec:results}
+% =========================================================================
+
+All runs use Mat\'ern-$7/2$, $\ell_u=1.0$, $\ell_w=0.2$, $\rho=3$,
+$\sigma=10^{-3}$, $6$ warm-up GN steps on a fixed $N_c=400$/$N_{d,c}=150$ coarse
+subset, and $3$ alternating outer steps; single CPU thread (JAX CPU backend).
+The coefficient error is $\mathrm{rel}_a=\norm{a-a_\star}_{L^2}/\norm{a_\star}_{L^2}$.
+
+\begin{table}[h]
+\centering
+\caption{End-to-end scaling with the coarse-warm-up default and the near-linear
+trailing-block $u$-step. Stage-1 (warm-up) is flat in $N$; total cost grows
+$\approx$ linearly; coefficient recovery is $N$-robust.}
+\label{tab:scaling}
+\begin{tabular}{rrrrrr}
+\toprule
+$N$ & $N_d$ & Stage-1 (s) & Stage-2 (s) & Total (s) & $\mathrm{rel}_a$ \\
+\midrule
+$800$   & $300$  & $6.6$  & $9.4$   & $22.7$  & $7.89\%$ \\
+$1600$  & $600$  & $6.9$  & $22.1$  & $41.0$  & $7.81\%$ \\
+$3200$  & $1200$ & $7.5$  & $69.6$  & $99.5$  & $7.73\%$ \\
+$6400$  & $2400$ & $11.3$ & $159.8$ & $214.9$ & $7.62\%$ \\
+$12800$ & $4800$ & $16.0$ & $349.8$ & $448.9$ & $7.40\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Reading the table.} (i) The warm-up (Stage 1) is flat ---
+the joint GN runs on the same fixed coarse subset regardless of $N$, and the
+only growing piece is the $\bigO(N)$ kriging evaluation. Compare the original
+full-$N$ joint GN warm-up, which cost $22$\,s at $N=800$ and $114$\,s at
+$N=1600$ (an $\bigO(N^{\sim 2})$ trajectory that would reach $\sim\!1800$\,s at
+$N=6400$). (ii) The total grows essentially linearly (quantified below).
+(iii) $\mathrm{rel}_a$ is flat-to-improving
+in $N$, confirming robust two-mode recovery at every size; the warm-up's coarse
+solve drives the coarse loss far below the full-$N$ warm-up's, so the kriged
+seed is actually a better basin point (the coarse-warm-up $\mathrm{rel}_a$
+\emph{improves} from $7.89\%$ to $7.40\%$ as $N$ grows, beating the full-$N$
+warm-up's $\approx 13\%$). Concretely, a $16\times$ increase in $N$ ($800\to
+12800$) raises the total wall by only $19.8\times$ --- an overall empirical
+exponent $\approx 1.08$ --- and the per-doubling ratio settles toward $\approx
+2.1$ at the largest sizes (the asymptotic regime where the near-linear terms
+dominate the fixed coarse-warm-up overhead).
+
+\paragraph{Per-step $u$-iteration counts.} Across the whole sweep the forward
+pCG inside \eqref{eq:bordered} converges in a number of iterations that does not
+grow with $N$ (high-$60$s to low-$70$s), and the $w$-update in $\sim\!13$
+iterations --- the hallmark of the screening preconditioner acting on a
+well-conditioned covariance operator, exactly as in the forward solver.
+
+\subsection{Isolating the field scaling: fixed $N_d$}\label{sec:fixedNd}
+
+Table~\ref{tab:scaling} grows the data set with the field, $N_d\propto N$, so it
+folds the dense $\bigO(N_d^2)$--$\bigO(N_d^3)$ data-block term into the measured
+exponent. To isolate the pure field/PDE scaling --- the part that should be
+near-linear --- we repeat the sweep with the number of noisy measurements
+\emph{held fixed} at $N_d=300$ while $N$ grows $16\times$ (Table~\ref{tab:fixedNd}).
+
+\begin{table}[h]
+\centering
+\caption{Fixed-$N_d$ sweep ($N_d=300$ for all $N$). With the data block frozen,
+the remaining cost is the field work (factor builds, forward pCG, kriging) and is
+cleanly near-linear; coefficient recovery is unchanged.}
+\label{tab:fixedNd}
+\begin{tabular}{rrrrrr}
+\toprule
+$N$ & $N_d$ & Stage-1 (s) & Stage-2 (s) & Total (s) & $\mathrm{rel}_a$ \\
+\midrule
+$800$   & $300$ & $6.9$  & $9.8$   & $23.4$  & $7.89\%$ \\
+$1600$  & $300$ & $7.0$  & $21.2$  & $39.8$  & $7.81\%$ \\
+$3200$  & $300$ & $7.6$  & $67.5$  & $96.8$  & $7.73\%$ \\
+$6400$  & $300$ & $11.1$ & $149.8$ & $201.1$ & $7.62\%$ \\
+$12800$ & $300$ & $15.8$ & $331.3$ & $423.5$ & $7.40\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent A $16\times$ increase in $N$ raises the total by $18.1\times$ (overall
+empirical exponent $\approx 1.05$; top-end per-doubling ratio $2.11$). The
+revealing comparison is against Table~\ref{tab:scaling} at $N=12800$: there
+$N_d$ had grown to $4800$ ($16\times$, so the dense block's $N_d^3$ grew
+$\sim\!4000\times$), yet the total wall is only $\sim\!6\%$ larger ($448.9$ vs.\
+$423.5$\,s) and the exponent barely moves ($1.08$ vs.\ $1.05$). \emph{The dense
+data block is not the bottleneck in this range:} the cost is dominated by the
+per-step field operations --- the screened factor builds and forward triangular
+solves --- which scale near-linearly. Holding $N_d$ fixed does not visibly
+``clean up'' the curve precisely because the peeled-off data block was already
+sub-dominant; the trailing-block identity \eqref{eq:trailing} kept the only
+field-coupled data cost at $\bigO(N)$, leaving the small dense $\bigO(N_d^3)$
+factorization as a cheap, $N$-decoupled additive constant.
+
+\subsection{Verification of the precision-factorization claims}\label{sec:verif}
+
+Two precision-factorization claims underlie the solver design: that incomplete
+Cholesky \emph{does} factor a screened precision-plus-nugget $\Th\inv+R\inv$
+(justifying the noisy-regression machinery), but \emph{does not} factor the
+Jacobian-sandwiched GN Hessian $H$ (justifying why the warm-up sidesteps $H$,
+Sec.~\ref{sec:warmup}). We checked both directly; the conclusions are distilled
+as Insight~6 (Sec.~\ref{sec:insights}).
+
+\paragraph{(a) ichol of $\Th\inv+R\inv$ works (at moderate $\sigma$).} We built
+the noiseless KL factor of a Matérn-$7/2$, $\ell=1$, $\rho=3$ covariance $\Th$ on
+$N$ random points, ran Alg.~4.1 to obtain $\tilde U\tilde U\T\approx\Th\inv+
+\sigma^{-2}I$, and preconditioned CG (rtol $10^{-8}$) on $\Sigma=\Th+\sigma^2 I$.
+
+\begin{table}[h]
+\centering
+\caption{ichol (Alg.~4.1) as a preconditioner for $\Sigma=\Th+\sigma^2 I$. At
+moderate $\sigma^2$ the iteration count is essentially $N$-independent and the
+factor stays sparse; at the tiny $\sigma$ of the Darcy problem it stalls.}
+\label{tab:ichol}
+\begin{tabular}{rrrr}
+\toprule
+& \multicolumn{1}{c}{$\sigma^2=10^{-2}$} & & \multicolumn{1}{c}{$\sigma^2=10^{-6}$}\\
+\cmidrule(lr){2-2}\cmidrule(lr){4-4}
+$N$ & CG iters ($\mathrm{nnz}(\tilde U)/\mathrm{nnz}(U)$) & & CG iters \\
+\midrule
+$400$  & $20$ \,($1.5$)  & & no conv.\ ($500^{+}$) \\
+$800$  & $35$ \,($1.7$)  & & no conv.\ ($500^{+}$) \\
+$1600$ & $34$ \,($1.8$)  & & no conv.\ ($500^{+}$) \\
+$3200$ & $42$ \,($1.8$)  & & no conv.\ ($500^{+}$) \\
+$6400$ & $46$ \,($1.9$)  & & no conv.\ ($500^{+}$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent At moderate noise this is a genuine, near-$N$-independent precision
+preconditioner. As $\sigma\to0$ (our $\sigma=10^{-3}$, i.e.\ $\sigma^2=10^{-6}$)
+the nugget $R\inv$ dominates and the factored correction degenerates: CG does not
+converge in $500$ iterations at any $N$. That stalling, plus the structural fact
+that Alg.~4.1 requires a \emph{uniform positive} nugget on every diagonal (it
+cannot encode the exact, $R=0$, PDE/boundary rows of the $u$-step), is exactly
+why the solver peels the data block (Sec.~\ref{sec:alt}) instead of factoring
+through the noise.
+
+\paragraph{(b) incomplete factorization of $H$ fails.} We dumped the fine joint
+Hessian $H$ at the first GN step and preconditioned CG on $Hx=g$ with an
+incomplete LU (the closest available drop-tolerance factorization) at three fill
+levels, alongside plain and Jacobi-preconditioned CG (rtol $10^{-6}$,
+maxiter $3000$).
+
+\begin{table}[h]
+\centering
+\caption{Preconditioned CG iteration count on the joint GN Hessian $Hx=g$. No
+incomplete factorization converges at any $N$ or fill; only the \emph{exact}
+block factorization (used in the warm-up, at $\bigO(N^{2.8})$ cost) solves it.}
+\label{tab:Hfail}
+\begin{tabular}{rrrrc}
+\toprule
+$N$ & $\kappa(H)$ & plain CG & Jacobi CG & spilu \\
+\midrule
+$400$  & $2.0\times10^{9}$ & $3000^{+}$ & $2653$ & no conv. \\
+$800$  & $5.2\times10^{8}$ & $3000^{+}$ & $2409$ & no conv. \\
+$1600$ & $3.7\times10^{8}$ & $3000^{+}$ & $2122$ & no conv. \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize spilu tested at three drop/fill settings up to
+$\mathrm{nnz}(\text{factor})=2.5\times\mathrm{nnz}(H)$; none converged in $3000$
+iterations. ``$3000^{+}$'' = hit the iteration cap.}
+\end{table}
+
+\noindent Even at $\mathrm{nnz}(\text{factor})=2.5\times\mathrm{nnz}(H)$ the
+incomplete factorization gives no convergence --- the sandwiched-operator
+obstruction, distinct from the well-behaved precision-plus-nugget of~(a). This is
+the quantitative basis for sidestepping $H$ via the coarse warm-up.
+
+% =========================================================================
+\section{Key insights: inverse problems with several GP priors and noise
+nuggets}\label{sec:insights}
+% =========================================================================
+
+The Darcy problem is a concrete instance of a recurring structure: an inverse
+problem with \emph{more than one} Gaussian-process prior (here $u$ and $w$) and
+one or more \emph{noise nuggets} --- $\sigma^2 I$ regularizations attached to
+noisy or soft observation functionals. The following lessons are what make the
+sparse-Cholesky machinery deliver forward-solve efficiency in that structure;
+they are stated so as to transfer to other multi-field GP-collocation inverse
+problems.
+
+\paragraph{Insight 1 --- one screened factor per field; never sum kernels.}
+With $k$ independent priors $\phi_m\sim\cGP(0,K_m)$ the loss is a sum of $k$
+RKHS norms $\sum_m \xi_m\T\Th_m\inv\xi_m$ \eqref{eq:loss}, \emph{each a
+single-kernel covariance}. Keep them that way: build one KL factor per kernel and
+apply them blockwise. The temptation is to collapse the fields into one composite
+observation functional $L=\sum_m c_m L_m$ acting on a summed kernel
+$\sum_m c_m^2 K_m$; this destroys screening, because the slow features of the
+smoothest kernel (here the long-range $\Delta u$ mode of $\ell_u=1$) get mixed
+into every entry and the truncated factor needs a large radius $\rho$ to stay
+accurate. Separateness is what keeps each $\rho$ in the elliptic regime
+($\rho=3$).
+
+\paragraph{Insight 2 --- give each field its own length scale (screening budget).}
+Different unknowns in an inverse problem have different regularity, and the
+sparsity radius needed for accurate screening is set \emph{per field}. The state
+$u$ is smooth (it solves an elliptic PDE) and is given a long $\ell_u$ so its
+derivatives, which pin the coefficient through the PDE, stay clean; the
+coefficient $w$ is rough and is given a short $\ell_w$ so its factor stays local.
+A single shared length scale forces a compromise that flattens the recovered
+coefficient. The multi-GP formulation is what \emph{allows} this per-field tuning
+--- another reason not to merge the priors.
+
+\paragraph{Insight 3 --- a noise nugget is benign in isolation but stiff when
+co-located with a hard constraint.} Adding $\sigma^2 I$ to a covariance block is
+a regularization and normally \emph{improves} conditioning. The danger in the
+inverse setting is geometric: when a \emph{noisy} functional sits on (or very
+near) a point already carrying a \emph{noiseless/hard} functional --- here the
+data $\delta_{x_j^d}$ co-located with the PDE collocation point $x_j^\Omega$, with
+tiny $\sigma$ --- the noisy row is nearly redundant with the hard row. Its
+conditional variance given the hard block is $\approx\sigma^2$, so the augmented
+Gram acquires a tight cluster of near-null modes whose count grows with the
+number of nuggets $N_d$. A local screened factor of the \emph{augmented} operator
+cannot resolve them at any practical $\rho$ (raising $\rho$ fixes one problem
+size but the stiff-mode count scales $\propto N_d$). \emph{Diagnose this by the
+ratio of nugget magnitude to the conditional variance of the noisy functional
+under the hard constraints; when $\sigma$ is small relative to that variance, do
+not precondition through the nugget block.}
+
+\paragraph{Insight 4 --- peel the nugget block with an exact Schur step; never
+fold it into the preconditioner.} Partition the functionals into the hard
+forward block $F$ (which screens perfectly and reproduces the forward solve) and
+the soft/nuggeted block $d$. Solve by the exact bordered/Schur formulas
+\eqref{eq:bordered}: apply $\Th_{FF}\inv$ with the forward pCG ($N$-independent
+iterations, the field's own small factor as preconditioner), couple through
+single big-factor mat-vecs $\Th_{Fd}$, and reduce to a small dense
+$N_d\times N_d$ system $S=S_0+\sigma^2 I$. This keeps the well-conditioned
+forward block on its native conditioning and confines the stiffness to the small
+dense block where it is harmless.
+
+\paragraph{Insight 5 --- read the nugget-block posterior covariance off the
+trailing precision block, not from forward solves.} The one object the Schur
+step needs, the data-block posterior precision $S_0\inv=(\Thtr\inv)_{dd}$, is
+\emph{already present} in the joint KL factor: by \eqref{eq:trailing} it is the
+dense Gram $U_d U_d\T$ of the $N_d$ permuted nugget rows of $U$, formed in
+$\bigO(\mathrm{nnz}(U_d))=\bigO(N)$ time with no forward solves. This is the
+identity that turns an $\bigO(N\cdot N_d)$ coupling into a near-linear one and is
+the linchpin of the whole scheme. (A single spurious large-variance mode appears
+in the screened $S_0$; it is benign, merely returning that data direction to the
+accurate forward solve.) The fixed-$N_d$ experiment (Sec.~\ref{sec:fixedNd})
+confirms the payoff: with the field-coupled data cost reduced to $\bigO(N)$, the
+remaining dense $\bigO(N_d^3)$ factorization is an $N$-decoupled constant and the
+total scales near-linearly.
+
+\paragraph{Insight 6 --- factor a precision only when it is a screened
+covariance-precision plus a diagonal; never the Jacobian-sandwiched normal form.}
+``Sparse Cholesky belongs on the covariance, not the precision'' is too blunt:
+incomplete Cholesky factors a \emph{precision} just fine when that precision is
+$\Th\inv+R\inv$ --- a screened covariance-precision plus a diagonal nugget. This
+is precisely the Schäfer--Katzfuss--Owhadi noisy variant (Alg.~4.1): build the
+noiseless KL factor $U$ of the covariance $\Th$ ($UU\T\approx\Th\inv$), then a
+\emph{second} incomplete Cholesky on the $UU\T$ pattern gives
+$\tilde U\tilde U\T\approx\Th\inv+R\inv$. As a preconditioner it solves
+$\Sigma=\Th+\sigma^2 I$ in an $N$-robust $\sim\!20$--$46$ CG iterations at
+moderate $\sigma^2$ (verified, Sec.~\ref{sec:verif}). The object that genuinely
+resists factorization is the GN normal-equations Hessian
+$H=J_v\T\Th_u\inv J_v+J_w\T\Th_w\inv J_w+D$ \eqref{eq:H}: the Jacobian
+sandwiching makes it a squared, biharmonic-like operator whose exact factor fills
+in ($\bigO(N^{2.8})$) and whose ill-conditioning ($\kappa(H)\sim10^{9}$) is
+\emph{not} of the screened form; an incomplete factorization of $H$ does not
+converge at any $N$ or fill, and Alg.~4.1 does not even apply since
+$H\ne\Th\inv+\mathrm{diag}$. Two further caveats sharpen the rule, both
+verified in Sec.~\ref{sec:verif}: (i) even the legitimate ichol of
+$\Th\inv+R\inv$ \emph{degrades as $\sigma\to0$} --- at our $\sigma=10^{-3}$ it
+stalls --- and (ii) Alg.~4.1 needs a \emph{uniform positive} nugget on every
+diagonal, so it cannot represent the exact ($R=0$) PDE/boundary rows of the
+$u$-step. Hence we peel the data block (Insight~4) rather than ichol through the
+noise, and sidestep $H$ entirely (Insight~7).
+
+\paragraph{Insight 7 --- decouple the nonconvexity: only the basin-defining field
+needs the expensive nonlinear solve.} Multi-field inverse problems are non-convex
+through the field coupling \eqref{eq:v3}. But the expensive global step (joint GN
+on $H$) is needed \emph{only} to land in the right basin, and the alternating
+refinement re-solves each field from scratch given the other. So run the
+nonlinear warm-up on a \emph{fixed coarse subset} ($\bigO(1)$ in $N$) and krige
+its output field onto all $N$ points ($\bigO(N)$) --- the basin is a property of
+the coefficient, captured at coarse resolution. This removes the only inherently
+global, superlinear computation from the fine-$N$ path. (It is not multigrid: one
+coarse solve, one kriging evaluation, no hierarchy or cycles.)
+
+% =========================================================================
+\section{Discussion}\label{sec:discussion}
+% =========================================================================
+
+The solver attains forward-elliptic efficiency for a two-field nonlinear inverse
+problem by keeping \emph{every} linear solve in covariance form and never
+touching the precision Hessian. The single remaining super-linear term is the
+dense $N_d\times N_d$ nugget-block solve; the fixed-$N_d$ sweep
+(Sec.~\ref{sec:fixedNd}) shows it is sub-dominant in the tested range, and
+screening $S$ (whose posterior covariance decays in space because the nugget
+sites are spatially distributed) would close the last gap and is the natural next
+step. As implemented, the method already delivers near-linear total cost with
+$N$-robust two-mode recovery over $N=800$--$12800$.
+
+\paragraph{Reproduction.} \texttt{examples/darcy\_inverse\_hybrid.py} with
+\texttt{-{}-warmup-mode coarse} (default), \texttt{-{}-noise-mode data-bordered},
+\texttt{-{}-kernel-sigma-u 1.0 -{}-kernel-sigma-w 0.2 -{}-rho-small 3
+-{}-warmup-steps 6 -{}-alt-steps 3}, sweeping \texttt{-{}-N-domain} /
+\texttt{-{}-N-data}.
+
+\end{document}

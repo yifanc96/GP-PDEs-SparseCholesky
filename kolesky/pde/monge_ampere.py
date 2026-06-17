@@ -8,7 +8,10 @@ Mirrors main_MongeAmpere2d.jl. Linearizing around current iterate
 i.e. the HessianDiracPointMeasurement with w_δ=0, w11=v_yy, w12=-2 v_xy, w22=v_xx.
 
 The big factor is a 5-set KL factorization over (δ_bdy, δ_int, ∂11_int,
-∂22_int, ∂12_int) via DiracsFirstThenUnifScale ordering.
+∂22_int, ∂12_int) via FollowDiracs ordering — each Hessian-component
+measurement at point ``k`` is inserted immediately after δ_k in the
+maximin ordering, keeping the per-point feature group in one supernode
+(necessary for accurate KL truncation at ρ=3).
 """
 
 from __future__ import annotations
@@ -113,9 +116,9 @@ def solve_monge_ampere_2d(
         _hd(X_domain,   0.0, 1.0, 0.0, 0.0),   # ∂12_int
     ]
 
-    log('[big factor] DiracsFirstThenUnifScale ordering + sparsity …')
+    log('[big factor] FollowDiracs ordering + sparsity …')
     t0 = time.perf_counter()
-    implicit_big = ImplicitKLFactorization.build_diracs_first_then_unif_scale(
+    implicit_big = ImplicitKLFactorization.build_follow_diracs(
         kernel, meas_big, rho_big, k_neighbors=k_neighbors, lambda_=lambda_, alpha=alpha,
     )
     t1 = time.perf_counter()
