@@ -49,6 +49,12 @@ htmlcov/
 /old/*
 docs/*.npz
 
+# LaTeX build byproducts
+*.aux
+*.log
+*.out
+*.toc
+
 # Julia remnants (kept on the `initial-julia-code` branch)
 *.jl.mem
 *.jl.cov
