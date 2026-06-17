@@ -336,8 +336,8 @@ kernel   = kl.MaternCovariance7_2(length_scale=0.2)
 
 # Multi-set build: pass a *list* of measurement groups. Plain `build` works
 # because the two groups live at different locations (boundary vs interior —
-# no co-location). For groups with co-located δ/Δδ pairs, use
-# `.build_follow_diracs(...)` or `.build_diracs_first_then_unif_scale(...)`.
+# no co-location). For groups with co-located δ + derivative pairs (PDE
+# solves), use `.build_follow_diracs(...)` (the recommended default).
 implicit = kl.ImplicitKLFactorization.build(kernel, [m_bdy, m_lap],
                                             rho=3.0, k_neighbors=3)
 explicit = kl.ExplicitKLFactorization(implicit, nugget=1e-10, backend='cpu')
@@ -372,10 +372,19 @@ Take-aways:
 - `stack_measurements` merges those groups into one batched measurement,
   which is also what you apply a kernel to (`kernel(all_meas)` gives
   the full `(N × N)` covariance in the same row order the factor uses).
-- For co-located groups (δ and Δδ at the *same* interior points, as in
-  PDE solves), use `.build_follow_diracs(...)` or
-  `.build_diracs_first_then_unif_scale(...)` instead — plain maximin
-  would see distance-zero ties. See Part 2 for details.
+- For co-located groups (δ and derivative measurements at the *same*
+  interior points, as in PDE solves), use `.build_follow_diracs(...)` —
+  it inserts each derivative immediately after its δ in the maximin
+  ordering, so `(δ_k, ∂_k, Δ_k, …)` share a supernode and the strong
+  on-point feature correlation is captured by the sparsity pattern.
+  Accurate at **ρ=3** in 2D for `LaplaceGradDirac` / `HessianDirac`
+  measurements. The alternative `.build_diracs_first_then_unif_scale(...)`
+  is theoretically valid and yields a sparser factor (no per-point
+  feature blowup of supernodes), but the derivative blocks land far from
+  their δ counterparts in the ordering, so the truncated pattern does
+  *not* express the on-point coupling — to get the same KL accuracy you
+  end up needing 2–3× larger ρ, which usually wipes out the storage
+  advantage. See Part 2 for details.
 
 ---
 
@@ -495,24 +504,35 @@ Plain reverse-maximin is ill-defined when PDE problems have
 **co-located measurement groups** — e.g. both `u(xᵢ)` and `Δu(xᵢ)` at
 every interior point, distance zero. Two canonical variants:
 
-- **FollowDiracs** — maximin on `(boundary δ, interior δ)`, then insert
-  each derivative measurement immediately after its δ. Keeps co-located
-  `(δ, Δδ)` pairs in the same supernode. We found this performs better
-  and leads to a sparser factor in our experiments. *Used by
-  `NonlinElliptic2d` and `Burgers1d`.*
-- **DiracsFirstThenUnifScale** — same maximin step, then append each
-  derivative block at the finest length scale. This is the variant
-  theoretically analyzed in our paper. *Used by `VarLinElliptic2d` and
-  `MongeAmpere2d`.*
+- **FollowDiracs** *(recommended default for derivative-rich kernels)* —
+  maximin on `(boundary δ, interior δ)`, then insert each derivative
+  measurement immediately after its δ in the global ordering, so
+  co-located `(δ, ∂₁, ∂₂, Δ, …)` features share a supernode. The
+  factorization can then represent the strong on-point coupling between
+  a function value and its derivatives, and the truncated sparsity
+  pattern is accurate at **ρ=3** in 2D. Cost: each spatial supernode
+  carries `n_dom_sets` measurements, so the factor is `O(n_dom_sets²)`
+  denser than a δ-only factor. *Used by all built-in PDE solvers.*
+- **DiracsFirstThenUnifScale** *(theoretically valid; needs larger ρ)* —
+  same maximin step, then append each derivative block at the finest
+  length scale, so derivatives at point `k` end up far from δ_k in the
+  ordering. The factor is per-point sparser (no feature blowup of
+  supernodes) and is the variant theoretically analyzed in the paper,
+  but the truncated pattern does *not* express the on-point coupling —
+  to recover the same KL accuracy as FollowDiracs you typically need
+  **2–3× larger ρ**, which usually wipes out the storage advantage. Use
+  only when you have point-evaluation-dominated measurements and very
+  weak derivative coupling.
 
-The measurement set for `Θ_big` is baked into each solver:
+The measurement set for `Θ_big` is baked into each solver (all built-in
+solvers now use FollowDiracs):
 
-| PDE                 | ordering                      | `Θ_big` measurement sets                    |
-| ------------------- | ----------------------------- | ------------------------------------------- |
-| `NonlinElliptic2d`  | FollowDiracs (3 sets)         | δ_bdy, δ_int, −Δ_int                         |
-| `VarLinElliptic2d`  | DiracsFirstThenUnifScale (3)  | δ_bdy, δ_int, `−a∆ − ∇a·∇` on int            |
-| `Burgers1d`         | FollowDiracs (4 sets)         | δ_bdy, δ_int, ∇_int, Δ_int                    |
-| `MongeAmpere2d`     | DiracsFirstThenUnifScale (5)  | δ_bdy, δ_int, ∂₁₁, ∂₂₂, ∂₁₂                   |
+| PDE                 | ordering                | `Θ_big` measurement sets                          |
+| ------------------- | ----------------------- | ------------------------------------------------- |
+| `NonlinElliptic2d`  | FollowDiracs (3 sets)   | δ_bdy, δ_int, −Δ_int                              |
+| `VarLinElliptic2d`  | FollowDiracs (3 sets)   | δ_bdy, δ_int, `−a∆ − ∇a·∇` on int                 |
+| `Burgers1d`         | FollowDiracs (4 sets)   | δ_bdy, δ_int, ∇_int, Δ_int                        |
+| `MongeAmpere2d`     | FollowDiracs (5 sets)   | δ_bdy, δ_int, ∂₁₁, ∂₂₂, ∂₁₂                       |
 
 ### Quickstart: `−Δu + α uᵐ = f` on `[0,1]²`
 
@@ -581,7 +601,8 @@ The **four-step recipe** every built-in solver follows:
 
 2. **Build the big factor** with the multi-set measurement list
    `(δ_bdy, δ_int, L_int …)` — call `ImplicitKLFactorization.build_follow_diracs`
-   or `.build_diracs_first_then_unif_scale`, then `ExplicitKLFactorization`.
+   (recommended; per-point feature groups stay in one supernode, accurate at ρ=3),
+   then `ExplicitKLFactorization`.
    This is the expensive step; do it once.
 
 3. **Build a small preconditioner factor** on the 2-set list `(δ_bdy,

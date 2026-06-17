@@ -134,7 +134,7 @@ class SteadyAdvDiffSolver:
 
     def __init__(self, box, X_dom, X_bdy, tag, kernel,
                  D, u_dom,
-                 rho_big=4.0, rho_small=4.0, k_neighbors=2,
+                 rho_big=3.0, rho_small=3.0, k_neighbors=2,
                  nugget=1e-6, backend='cpu'):
         self.box = box
         self.X_dom = X_dom; self.X_bdy = X_bdy; self.tag = tag
@@ -160,7 +160,7 @@ class SteadyAdvDiffSolver:
         )
         print('[build] big factor (3-set) …', flush=True)
         t0 = time.perf_counter()
-        impl_big = kl.ImplicitKLFactorization.build_diracs_first_then_unif_scale(
+        impl_big = kl.ImplicitKLFactorization.build_follow_diracs(
             kernel, [m_bdy, m_d_int, m_deriv_int], rho=rho_big, k_neighbors=k_neighbors,
         )
         self.expl_big = kl.ExplicitKLFactorization(impl_big, nugget=nugget, backend=backend)
@@ -231,8 +231,8 @@ def parse_args(argv=None):
     p.add_argument('--source-x', type=float, default=0.55,
                    help='x-coordinate of the source (upstream of cylinder)')
     p.add_argument('--nugget', type=float, default=1e-6)
-    p.add_argument('--rho-big',   type=float, default=4.0)
-    p.add_argument('--rho-small', type=float, default=4.0)
+    p.add_argument('--rho-big',   type=float, default=3.0)
+    p.add_argument('--rho-small', type=float, default=3.0)
     p.add_argument('--k-neighbors', type=int, default=2)
     p.add_argument('--backend', default='cpu', choices=['cpu', 'jax'])
     p.add_argument('--platform', default='cpu')

@@ -1,43 +1,53 @@
-"""Darcy inverse via joint-GN warm-up + alternating refinement (sparse Cholesky pCG).
+"""Near-linear sparse-Cholesky solver for the Darcy inverse problem.
 
-Sibling of ``examples/darcy_inverse_pcg.py`` (joint GN with two-block
-sparse-LU preconditioner). The user's mental model: alternating solve
-*is* "forward PDE solve (u | a) → inverse coefficient solve (a | u)",
-which is the natural problem split. Pure alternating from ``w = 0``
-gets stuck at the trivial fixed point because the u-step at ``w = 0``
-forces ``v3 = −f`` exactly, killing the w-step's signal. Joint GN does
-not stall but its block-Jacobi pCG preconditioner ignores the v3
-coupling and needs hundreds of iters at large N.
+Recover both the diffusion coefficient ``a = exp(w)`` and the state ``u``
+of ``-div(exp(w) grad u) = f`` from a forcing, boundary data, and noisy
+interior measurements of ``u``. Total cost grows essentially linearly in
+the number of collocation points ``N`` — the same complexity class as a
+single forward elliptic solve, up to a constant for the second field.
+Companion note: ``docs/darcy_inverse_nearlinear_note.tex``.
 
-The hybrid: a few joint-GN steps to escape the trivial basin, then
-switch to alternating where each subproblem is a single-GP regression
-(``nonlin_elliptic`` template — small-factor sparse Cholesky as
-preconditioner, ``O(10–30)`` pCG iters per subproblem).
+Two independent mean-zero GP priors are placed on the fields, ``u ~ GP(0,
+K_u)`` and ``w ~ GP(0, K_w)``, both Matérn-7/2 but with separate length
+scales (long ``ell_u`` for the smooth state, short ``ell_w`` for the rough
+coefficient). The two kernels are NEVER summed: each Gram matrix stays a
+single-kernel covariance that the screening (KL) sparse-Cholesky theory
+can factor in near-linear time. The MAP loss is the sum of the two prior
+RKHS norms plus the ``(1/σ²)``-weighted data misfit.
 
-Stage 1 (joint warm-up): ``warmup_steps`` joint-GN steps — same code
-as ``darcy_inverse_pcg.py``. Output: non-trivial ``z̄ = (w̄, ū)``.
+Stage 1 — warm-up (basin finder), ``--warmup-mode``:
+  * 'coarse' (default): run a few joint Gauss-Newton steps on a FIXED
+    coarse subset (cost O(1) in fine N), then krige the recovered
+    w-field to all N points via the Θ_w cross-covariance (O(N)). This
+    sidesteps ever assembling/factoring the dense, biharmonic-like joint
+    GN Hessian on the fine grid.
+  * 'joint-gn': joint-GN on all N points (~N² per step; for comparison).
+  * 'data-first': seed w by regressing u from data alone (stalls; kept
+    for reference).
 
-Stage 2 (alternating refinement): ``alt_steps`` outer iterations.
-  * **u | w step**: With ``w̄`` fixed, solve ``L_u u = f exp(−w̄₀)``
-    with boundary ``u = g``, noisy data ``u(x_i) ≈ y_i + N(0, σ²)``,
-    where ``L_u = −Δ − w̄₁ ∂₁ − w̄₂ ∂₂``. Constraint set
-    ``[δ_bdy, δ_data, L_u_int]``; α has size ``Nb + Nd + N``. Big
-    factor ``U_big_u`` (5-set, built once); small factor on the
-    constraint set (rebuilt per step, weights depend on w̄).
-  * **w | u step**: With ``ū`` fixed, solve ``L_w w = v̄₃ +
-    f exp(−w̄₀)(1 + w̄₀)`` where ``L_w = f exp(−w̄₀) δ + (−v̄₁) ∂₁ +
-    (−v̄₂) ∂₂`` (linearized at w̄). Constraint set ``[L_w_int]``;
-    α has size ``N``. Big factor ``U_big_w`` (3-set + dummy bdy);
-    small factor on constraint set.
+Stage 2 — alternating refinement, ``--alt-steps`` outer iterations. With
+one field frozen the loss is a linear GP regression in the other:
+  * u | w step (the hard half): solve the posterior mean of u under
+    ``[δ_bdy = g, L_w u = -f exp(-w̄₀) on the interior, u(x_d) ≈ y]``,
+    where ``L_w u = Δu + w̄₁ ∂₁u + w̄₂ ∂₂u``. The noisy data δ are
+    co-located with the PDE points and σ is tiny, so a screened factor of
+    the full augmented operator cannot resolve the near-null data modes.
+    The 'data-bordered' u-step instead does an EXACT bordered/Schur solve:
+    the forward block F={bdy, PDE} is applied by the screened forward pCG
+    (N-independent iters), and the Nd data rows are peeled into a small
+    dense Nd×Nd system whose posterior covariance S0⁻¹ = (Θ_joint⁻¹)_dd is
+    read off the joint precision factor as a Gram of Nd sparse rows of U —
+    no per-data forward solves.
+  * w | u step (easy): a single-GP regression on Θ_w, ~O(10) pCG iters.
 
-After Stage 2, the predicted ``u(x*) = k(δ_x*, train_u) · α_u`` and
+After Stage 2: ``u(x*) = k(δ_x*, train_u) · α_u`` and
 ``a(x*) = exp(k(δ_x*, train_w) · α_w)``.
 
-Key cost difference from ``darcy_inverse_pcg.py``:
-  joint-pcg: ~30 s × 6 GN steps for block-LU on H_uu, H_ww at N=2500.
-  hybrid   : ~30 s × ``warmup_steps`` (joint), plus ~5 s per alternating
-             step (small-factor cholesky + ~20 pCG iters at α-space size).
-For ``warmup_steps = 2, alt_steps = 6`` at N=2500: ~90 s total vs ~3 min.
+Running with no flags uses the note's configuration (coarse warm-up,
+data-bordered u-step, ell_u=1.0 / ell_w=0.2, rho=3, 6 warm-up + 3
+alternating steps). Reproduce the scaling tables by sweeping the size::
+
+    python examples/darcy_inverse_hybrid.py --N-domain 800 --N-data 300
 """
 
 from __future__ import annotations
@@ -464,18 +474,10 @@ def data_first_warmup(kl, kernel_u, kernel_w, expl_w, sf_w, X_dom, X_bdy, X_data
 #                with weights (-w̄₁[k], -w̄₂[k], -1.0)
 #   α_data[k] →  feat_δ_int[k]   for k < Nd          weight 1
 #
-# Two noise modes:
-#   * 'data': only data points have noise (σ²). Operator =
-#     Θ_train + R_data with R_data = σ² on data block, 0 elsewhere.
-#     Preconditioner = noiseless small-factor Cholesky of Θ_train
-#     (no ichol noise-correction). With data ordered LAST, the
-#     screening effect of PDE Diracs keeps the noiseless factor
-#     accurate where it matters.
-#   * 'uniform': treat ALL collocations as having σ²-noise (homoscedastic).
-#     Operator = Θ_train + σ² I. Preconditioner = Algorithm 4.1 noisy
-#     ichol of Θ_train⁻¹ + (1/σ²) I — exactly the regime ichol was
-#     designed for. Slight model mismatch (PDE constraint becomes
-#     "soft" with σ² slack) but very clean preconditioning.
+# Operator: Θ_train + R_data with R_data = σ² on the data block, 0
+# elsewhere (the true two-valued nugget — exact bdy/PDE rows, noisy data
+# rows). The u-step solves this by the exact bordered/Schur split rather
+# than preconditioning through the near-null data modes.
 
 
 class ThetaTrainOpU:
@@ -485,11 +487,11 @@ class ThetaTrainOpU:
 
     The matvec adds the noise term to the operator according to the
     selected noise_mode:
-      * 'data'    : σ² · α_data on the data block only.
-      * 'uniform' : σ² · α everywhere (homoscedastic).
-      * 'none'    : no noise term — pure K matvec. Used by the SMW
-        preconditioner's inner-pCG K-solve (where the operator IS K
-        alone, separately from the σ²-data correction).
+      * 'data' : σ² · α_data on the data block only (the true two-valued
+        operator: σ² on data rows, exact elsewhere).
+      * 'none' : no noise term — pure K matvec. Used by the bordered-solve
+        forward-block operators (the σ²-data block is handled separately
+        by the dense Schur complement).
     """
     def __init__(self, expl_u, sf_u, Nb, N, Nd, sigma, noise_mode='data'):
         self.U_csr  = sf_u.U_csr
@@ -538,8 +540,6 @@ class ThetaTrainOpU:
         Aalpha = self._extract(Theta_v)
         if self.noise_mode == 'data':
             Aalpha[self.Nb + self.N :] += self.sigma2 * alpha[self.Nb + self.N :]
-        elif self.noise_mode == 'uniform':
-            Aalpha += self.sigma2 * alpha
         elif self.noise_mode == 'none':
             pass  # pure K matvec, no noise term
         else:
@@ -594,97 +594,6 @@ def _meas_constraint_u(X_bdy, X_dom, X_data, w1, w2, data_order='last'):
     raise ValueError(f'data_order must be "last" or "before", got {data_order!r}')
 
 
-def _meas_constraint_u_fd(X_bdy, X_dom, Nd, w1, w2):
-    """FollowDiracs-grouped constraint measurements for the u | w step.
-
-    The plain ``build`` path runs maximin on the *union* of coordinates,
-    and since the data δ-points are co-located with PDE collocation
-    points (``X_data = X_dom[:Nd] ⊂ X_dom``), the union has duplicate
-    coordinates → degenerate maximin / poor screening (needs huge ρ).
-
-    Mirror how the big factor and the forward solver treat co-located
-    functionals: group the data δ with the PDE L_w measurement *at the
-    same point* into a single supernode via ``build_follow_diracs``.
-    Layout (n_dom_sets = 2 over the Nd data points):
-
-        group[0] = [bdy-δ (Nb)] ⊕ [non-data PDE L_w (N-Nd)]   (maximin set 0)
-        group[1] = [data PDE L_w (Nd)]                          (maximin set 1, δ-ref)
-        group[2] = [data δ (Nd)]                                (follows group[1])
-
-    All coordinates are now *distinct* across the two maximin sets (data
-    points appear only in group[1]/group[2], non-data only in group[0]),
-    so maximin is non-degenerate; multi-set ordering forces the data
-    points to the finest scale (screened by the abundant PDE points).
-
-    Returns ``(measurements, src)`` where ``src`` maps the small factor's
-    natural merged measurement order to the Θ_train α-layout
-    ``[bdy(Nb), pde(N), data(Nd)]``:  ``merged_vec = alpha[src]``.
-    """
-    Nb = X_bdy.shape[0]; N = X_dom.shape[0]
-    grad = np.stack([-w1, -w2], axis=1)
-    X_data = X_dom[:Nd]; X_rest = X_dom[Nd:]
-    bdy      = _lgd(X_bdy,  np.zeros(Nb),     np.zeros((Nb, 2)),     np.ones(Nb))
-    pde_rest = _lgd(X_rest, -np.ones(N - Nd), grad[Nd:],             np.zeros(N - Nd))
-    pde_data = _lgd(X_data, -np.ones(Nd),     grad[:Nd],             np.zeros(Nd))
-    dat      = _lgd(X_data, np.zeros(Nd),     np.zeros((Nd, 2)),     np.ones(Nd))
-    measurements = [[bdy, pde_rest], pde_data, dat]
-    src = np.concatenate([
-        np.arange(Nb),                 # bdy        -> α bdy block
-        Nb + np.arange(Nd, N),         # non-data pde -> α pde block (tail)
-        Nb + np.arange(Nd),            # data pde   -> α pde block (head)
-        Nb + N + np.arange(Nd),        # data δ     -> α data block
-    ]).astype(np.int64)
-    return measurements, src
-
-
-def _build_small_precond_alpha(args, kernel, X_bdy, X_dom, Nd, w1, w2, N, Nb):
-    """Build the noiseless small-factor inverse M_0 ≈ Θ_train⁻¹ as a matvec
-    in the Θ_train α-layout [bdy(Nb), pde(N), data(Nd)], for the
-    parameterized ``--noise-mode small`` experiments.
-
-    Controlled by:
-      * ``--small-algo``: 'build' (plain maximin on the coordinate union)
-        or 'follow-diracs' (group each data point's {L_w, δ} into one
-        supernode — robust to the co-located data/PDE coordinates).
-      * ``--data-order`` (plain build only): 'last' → [bdy, pde, data];
-        'before' → [bdy, data, pde]. Changes the multi-set maximin
-        sequence (which block is coarse vs. fine).
-
-    Returns ``(M0, src)`` where ``M0(v)`` applies the small-factor inverse
-    in α-layout and ``src`` maps α-layout → the factor's merged order
-    (``merged = v[src]``).
-    """
-    import kolesky as kl
-    from kolesky.pde.pcg_ops import SmallPrecond
-    if args.small_algo == 'follow-diracs':
-        meas, src = _meas_constraint_u_fd(X_bdy, X_dom, Nd, w1, w2)
-        impl = kl.ImplicitKLFactorization.build_follow_diracs(
-            kernel, meas, rho=args.rho_small, k_neighbors=args.k_neighbors)
-    else:  # plain build
-        X_data = X_dom[:Nd]
-        meas = _meas_constraint_u(X_bdy, X_dom, X_data, w1, w2,
-                                  data_order=args.data_order)
-        impl = kl.ImplicitKLFactorization.build(
-            kernel, meas, rho=args.rho_small, k_neighbors=args.k_neighbors)
-        if args.data_order == 'last':           # merged [bdy, pde, data] == α
-            src = np.arange(Nb + N + Nd, dtype=np.int64)
-        else:                                   # 'before': merged [bdy, data, pde]
-            src = np.concatenate([
-                np.arange(Nb),
-                Nb + N + np.arange(Nd),
-                Nb + np.arange(N),
-            ]).astype(np.int64)
-    nugget = (args.pc_nugget if (args.pc_nugget is not None and args.pc_nugget >= 0.0)
-              else args.nugget)
-    expl = kl.ExplicitKLFactorization(impl, nugget=nugget, backend='cpu')
-    base = SmallPrecond(expl.U, expl.P)
-
-    def M0(v, base=base, src=src):
-        out = np.empty_like(v)
-        out[src] = base.matvec(v[src])
-        return out
-
-    return M0, src
 
 
 # ---- w | u  subproblem -----------------------------------------------------
@@ -770,64 +679,49 @@ def parse_args(argv=None):
     p.add_argument('--N-fd', type=int, default=120)
     p.add_argument('--kernel', default='Matern7half',
                    choices=['Gaussian', 'Matern5half', 'Matern7half'])
-    p.add_argument('--kernel-sigma', type=float, default=0.2)
+    p.add_argument('--kernel-sigma', type=float, default=None,
+                   help="shared lengthscale override applied to BOTH fields when "
+                        "the per-field flags below are unset. Leaving everything "
+                        "unset uses the recommended split (ℓ_u=1.0, ℓ_w=0.2).")
     p.add_argument('--kernel-sigma-u', type=float, default=None,
-                   help="lengthscale for the Θ_u (PDE/u-field) prior. Defaults "
-                        "to --kernel-sigma. Recovering the coefficient's spatial "
-                        "structure needs a LONG ℓ_u (≈1.0): u solves an elliptic "
-                        "PDE so it is smooth, and a short ℓ_u injects spurious "
-                        "short-scale wiggles whose Laplacian (which pins a through "
-                        "the PDE) is garbage. See --kernel-sigma-w.")
+                   help="lengthscale for the Θ_u (PDE/u-field) prior (default 1.0). "
+                        "Recovering the coefficient's spatial structure needs a "
+                        "LONG ℓ_u (≈1.0): u solves an elliptic PDE so it is smooth, "
+                        "and a short ℓ_u injects spurious short-scale wiggles whose "
+                        "Laplacian (which pins a through the PDE) is garbage. See "
+                        "--kernel-sigma-w.")
     p.add_argument('--kernel-sigma-w', type=float, default=None,
-                   help="lengthscale for the Θ_w (coefficient) prior. Defaults to "
-                        "--kernel-sigma. Keep SHORT (≈0.2) so a can have sharp "
-                        "peaks and the w-factor stays local/sparse.")
+                   help="lengthscale for the Θ_w (coefficient) prior (default 0.2). "
+                        "Keep SHORT (≈0.2) so a can have sharp peaks and the "
+                        "w-factor stays local/sparse.")
     p.add_argument('--rho', type=float, default=3.0)
     p.add_argument('--rho-small', type=float, default=3.0)
     p.add_argument('--k-neighbors', type=int, default=4)
     p.add_argument('--nugget', type=float, default=1e-8)
-    p.add_argument('--pc-nugget', type=float, default=-1.0,
-                   help="uniform-floor nugget for the data-smw preconditioner "
-                        "base factor M_0 ≈ (Θ_train + ε²I)⁻¹, decoupled from the "
-                        "operator nugget. <0 means reuse --nugget. The two-valued "
-                        "diagonal R is split as ε²I (uniform, Schäfer-factorizable) "
-                        "+ rank-Nd data correction (lifted to σ² by SMW).")
-    p.add_argument('--warmup-steps', type=int, default=2)
+    p.add_argument('--warmup-steps', type=int, default=6)
     p.add_argument('--warmup-mode', default='coarse',
-                   choices=['joint-gn', 'coarse', 'data-first'],
-                   help="Stage-1 basin-finder. 'joint-gn' (default): joint-GN on "
-                        "all N points (~N^2 splu/step). 'coarse': run joint-GN on a "
-                        "fixed coarse subset (--warmup-coarse-N pts) then krige the "
+                   choices=['coarse', 'joint-gn', 'data-first'],
+                   help="Stage-1 basin-finder. 'coarse' (default): run joint-GN on "
+                        "a fixed coarse subset (--warmup-coarse-N pts) then krige the "
                         "recovered w-field to all N via the Θ_w cross-cov — cost O(1) "
-                        "in fine N. 'data-first': GP-regress u from data+bdy alone "
-                        "(no PDE), then one w|u solve to seed w — no joint-GN at all.")
+                        "in fine N. 'joint-gn': joint-GN on all N points "
+                        "(~N^2 per step; not near-linear). 'data-first': GP-regress u "
+                        "from data+bdy alone (no PDE), then one w|u solve to seed w.")
     p.add_argument('--warmup-coarse-N', type=int, default=400,
                    help="interior point budget for --warmup-mode coarse.")
     p.add_argument('--warmup-coarse-Nd', type=int, default=150,
                    help="data point budget for --warmup-mode coarse.")
-    p.add_argument('--alt-steps', type=int, default=6)
+    p.add_argument('--alt-steps', type=int, default=3)
     p.add_argument('--pcg-rtol', type=float, default=1e-6)
     p.add_argument('--pcg-maxiter', type=int, default=200)
-    p.add_argument('--eps-pde', type=float, default=1e-8,
-                   help="floor ε² on the boundary/PDE rows for the two-valued "
-                        "Schäfer preconditioner ('schafer-2val' mode). The true "
-                        "operator has ~0 there; ε²>0 makes R invertible so the "
-                        "ichol of Θ⁻¹+R⁻¹ exists. ε²→0 recovers the exact "
-                        "constraints; sweep to find where Schäfer accuracy breaks.")
-    p.add_argument('--noise-mode', default='data',
-                   choices=['data', 'small', 'data-fd', 'data-fd-smw', 'data-smw', 'data-schur', 'data-bordered', 'uniform', 'schafer-2val'],
-                   help="'data' (default): noise σ² only on data points; "
-                        "preconditioner = noiseless small-factor Cholesky of Θ_train. "
-                        "'uniform': treat ALL collocations as σ²-noisy "
-                        "(homoscedastic); preconditioner = Algorithm 4.1 noisy "
-                        "ichol of Θ_train⁻¹ + (1/σ²) I.")
-    p.add_argument('--small-algo', default='build', choices=['build', 'follow-diracs'],
-                   help="small-Θ factorization algorithm for --noise-mode small: "
-                        "'build' (plain maximin on coord union) or 'follow-diracs' "
-                        "(group co-located data δ + PDE L_w per point).")
-    p.add_argument('--small-smw', action='store_true',
-                   help="for --noise-mode small: add exact rank-Nd SMW data-noise "
-                        "correction on top of the noiseless small factor.")
+    p.add_argument('--noise-mode', default='data-bordered',
+                   choices=['data-bordered'],
+                   help="u-step solver. 'data-bordered' (default): exact "
+                        "bordered/Schur solve — the forward block {bdy, PDE} is "
+                        "applied by the screened forward pCG, the Nd noisy data rows "
+                        "are peeled into a small dense Nd×Nd block whose posterior "
+                        "covariance is read off the joint precision factor "
+                        "(near-linear).")
     p.add_argument('--data-order', default='last', choices=['last', 'before'],
                    help="small-factor (plain build) group order for data δ vs "
                         "PDE block: 'last' = [bdy, pde, data] (data finest in "
@@ -848,8 +742,9 @@ def main(argv=None):
         'Matern5half': kl.MaternCovariance5_2,
         'Matern7half': kl.MaternCovariance7_2,
     }
-    ell_u = args.kernel_sigma_u if args.kernel_sigma_u is not None else args.kernel_sigma
-    ell_w = args.kernel_sigma_w if args.kernel_sigma_w is not None else args.kernel_sigma
+    shared = args.kernel_sigma
+    ell_u = args.kernel_sigma_u if args.kernel_sigma_u is not None else (shared if shared is not None else 1.0)
+    ell_w = args.kernel_sigma_w if args.kernel_sigma_w is not None else (shared if shared is not None else 0.2)
     kernel_u = kernels[args.kernel](ell_u)   # Θ_u (PDE/u-field) prior
     kernel_w = kernels[args.kernel](ell_w)   # Θ_w (coefficient) prior
     kernel = kernel_u                        # back-compat default for shared call sites
@@ -940,10 +835,7 @@ def main(argv=None):
     # ----- Stage 2: alternating refinement -----
     print(f'\n[stage 2] alternating refinement: {args.alt_steps} outer steps  '
           f'(noise_mode={args.noise_mode})')
-    # 'data-smw' and 'schafer-2val' both precondition the TRUE two-valued
-    # operator (σ² on data rows only), so the operator stays in 'data' mode.
-    op_noise_mode = 'data' if args.noise_mode in ('small', 'data-smw', 'data-fd', 'data-fd-smw', 'data-schur', 'data-bordered', 'schafer-2val') else args.noise_mode
-    op_u = ThetaTrainOpU(expl_u, sf_u, Nb, N, Nd, sigma, noise_mode=op_noise_mode)
+    op_u = ThetaTrainOpU(expl_u, sf_u, Nb, N, Nd, sigma, noise_mode='data')
     op_w = ThetaTrainOpW(expl_w, sf_w, N)
 
     alpha_u = None; alpha_w = None
@@ -964,305 +856,71 @@ def main(argv=None):
         expl_su = kl.ExplicitKLFactorization(impl_su, nugget=args.nugget, backend='cpu')
         _prof['u_precond_build'] = time.perf_counter() - _tp
 
-        # Preconditioner: depends on noise_mode.
-        #   * 'data':    kolesky sparse Cholesky of Θ_train + low-rank
-        #     Sherman-Morrison-Woodbury correction for the rank-Nd data
-        #     noise. Operator is Θ + σ² E_dᵀ E_d. Apply via
-        #         M⁻¹ v = M_sparse v - M_sparse E_dᵀ (σ²I + Θ_dd)⁻¹ E_d M_sparse v
-        #     where M_sparse ≈ Θ (= U U^T from the noiseless small factor)
-        #     and Θ_dd = E_d Θ E_dᵀ is Nd × Nd dense (cached Cholesky at
-        #     setup time). One extra small dense solve and one extra sparse
-        #     matvec per pCG iter — turns the precond's effective
-        #     condition number from O(σ²·‖Θ⁻¹‖) back to O(1) regardless
-        #     of σ. Nd is small (typically Nd ≪ N), so the Nd × Nd
-        #     dense block is cheap.
-        #   * 'uniform': Algorithm 4.1 noisy ichol of Θ_train⁻¹ + (1/σ²) I
-        #     (homoscedastic — Algorithm 4.1's stable regime).
+        # ---- u | w solve: near-linear DIRECT bordered/Schur step, no outer CG.
         from kolesky.pde.pcg_ops import SmallPrecond
-        if args.noise_mode == 'small':
-            # Unified parameterized small-Θ preconditioner for ordering /
-            # algorithm experiments. --small-algo {build, follow-diracs},
-            # --data-order {last, before} (plain build), --small-smw to add
-            # the exact rank-Nd data-noise SMW correction on top.
-            _tp = time.perf_counter()
-            M0, _src = _build_small_precond_alpha(
-                args, kernel_u, X_bdy, X_dom, Nd, w1, w2, N, Nb)
-            _prof['u_precond_build'] = _prof.get('u_precond_build', 0.0) + (time.perf_counter() - _tp)
-            n_alpha = Nb + N + Nd
-            if (not args.small_smw) or Nd == 0:
-                M_u_op = spla.LinearOperator((n_alpha, n_alpha), matvec=M0, dtype=np.float64)
-            else:
-                import scipy.linalg as _sla
-                sigma2 = float(sigma * sigma)
-                d_rows = Nb + N + np.arange(Nd)
-                _tp = time.perf_counter()
-                W = np.empty((n_alpha, Nd))
-                ej = np.zeros(n_alpha)
-                for j in range(Nd):
-                    ej[d_rows[j]] = 1.0
-                    W[:, j] = M0(ej)
-                    ej[d_rows[j]] = 0.0
-                _prof['u_smw_Wloop'] = time.perf_counter() - _tp
-                B = (1.0 / sigma2) * np.eye(Nd) + W[d_rows, :]
-                B = 0.5 * (B + B.T)
-                B_chol = _sla.cho_factor(B, lower=True)
-                def Minv_small_smw(v, M0=M0, W=W, B_chol=B_chol, d_rows=d_rows):
-                    y1 = M0(v)
-                    s = _sla.cho_solve(B_chol, y1[d_rows])
-                    return y1 - W @ s
-                M_u_op = spla.LinearOperator((n_alpha, n_alpha), matvec=Minv_small_smw, dtype=np.float64)
-        elif args.noise_mode == 'data':
-            precond_u = SmallPrecond(expl_su.U, expl_su.P)
-            M_u_op = precond_u.as_linear_operator()
-        elif args.noise_mode in ('data-fd', 'data-fd-smw'):
-            # FollowDiracs-grouped small factor: data δ co-located with the
-            # PDE L_w measurement are kept in a single supernode (no
-            # degenerate maximin on duplicate coords). The small factor
-            # itself ≈ Θ_train⁻¹ (noiseless). Its natural measurement order
-            # differs from the α-layout, so wrap with the `src` permutation.
-            meas_fd, src_fd = _meas_constraint_u_fd(X_bdy, X_dom, Nd, w1, w2)
-            impl_fd = kl.ImplicitKLFactorization.build_follow_diracs(
-                kernel_u, meas_fd, rho=args.rho_small, k_neighbors=args.k_neighbors,
-            )
-            expl_fd = kl.ExplicitKLFactorization(impl_fd, nugget=args.nugget, backend='cpu')
-            base_fd = SmallPrecond(expl_fd.U, expl_fd.P)
-            n_alpha = Nb + N + Nd
-            if args.noise_mode == 'data-fd' or Nd == 0:
-                def Minv_fd(v, base=base_fd, src=src_fd):
-                    out = np.empty_like(v)
-                    out[src] = base.matvec(v[src])
-                    return out
-                M_u_op = spla.LinearOperator((n_alpha, n_alpha), matvec=Minv_fd, dtype=np.float64)
-            else:
-                # data-fd-smw: lift the data rows from the noiseless base to
-                # σ² via exact rank-Nd Sherman-Morrison-Woodbury.
-                #   M = (Θ + σ² E_dᵀ E_d)⁻¹,  M_0 ≈ Θ⁻¹ (the follow-diracs base)
-                #   M v = M_0 v - W (σ⁻²I + E_d W)⁻¹ E_d M_0 v,  W = M_0 E_dᵀ
-                import scipy.linalg as _sla
-                sigma2 = float(sigma * sigma)
-                d_rows = Nb + N + np.arange(Nd)  # data block in α-layout
-                def M0(v, base=base_fd, src=src_fd):
-                    out = np.empty_like(v)
-                    out[src] = base.matvec(v[src])
-                    return out
-                W = np.empty((n_alpha, Nd))
-                ej = np.zeros(n_alpha)
-                for j in range(Nd):
-                    ej[d_rows[j]] = 1.0
-                    W[:, j] = M0(ej)
-                    ej[d_rows[j]] = 0.0
-                B = (1.0 / sigma2) * np.eye(Nd) + W[d_rows, :]
-                B = 0.5 * (B + B.T)
-                B_chol = _sla.cho_factor(B, lower=True)
-                def Minv_fd_smw(v, M0=M0, W=W, B_chol=B_chol, d_rows=d_rows):
-                    y1 = M0(v)
-                    s = _sla.cho_solve(B_chol, y1[d_rows])
-                    return y1 - W @ s
-                M_u_op = spla.LinearOperator((n_alpha, n_alpha), matvec=Minv_fd_smw, dtype=np.float64)
-        elif args.noise_mode == 'data-smw':
-            # Precomputed Sherman-Morrison-Woodbury preconditioner for the
-            # rank-Nd data noise. M_0 ≈ Θ_train⁻¹ is the small-factor
-            # matvec; W := M_0 · E_dᵀ (Nd columns) is precomputed via Nd
-            # sparse matvecs; B := σ⁻²I_Nd + E_d·W is dense Nd×Nd; one
-            # dense Cholesky in setup. Per apply: y1 = M_0 v;
-            # y2 = W·(B⁻¹·(E_d y1)); return y1 - y2. No inner pCG.
-            # Base factor M_0 ≈ (Θ_train + ε²I)⁻¹. With --pc-nugget the floor
-            # ε² (relative) is raised ABOVE the operator's nugget, so the
-            # factorized operator is well-conditioned and screening-accurate
-            # even when the bare Θ_train is near-singular at large N. The
-            # rank-Nd SMW step below then lifts only the data rows to σ².
-            if args.pc_nugget is not None and args.pc_nugget >= 0.0:
-                expl_su_pc = kl.ExplicitKLFactorization(
-                    impl_su, nugget=args.pc_nugget, backend='cpu')
-                base = SmallPrecond(expl_su_pc.U, expl_su_pc.P)
-            else:
-                base = SmallPrecond(expl_su.U, expl_su.P)
-            n_alpha = Nb + N + Nd
-            sigma2 = float(sigma * sigma)
-            # W = M_0 · E_dᵀ: Nd columns, one per data row in α-layout.
-            W = np.empty((n_alpha, Nd), dtype=np.float64)
-            ej = np.zeros(n_alpha)
-            for j in range(Nd):
-                ej[Nb + N + j] = 1.0
-                W[:, j] = base.matvec(ej)
-                ej[Nb + N + j] = 0.0
-            # B = σ⁻²·I + E_d · W = σ⁻²·I + W[data rows]
-            B = (1.0 / sigma2) * np.eye(Nd) + W[Nb + N :, :]
-            B = 0.5 * (B + B.T)
-            B_chol = np.linalg.cholesky(B)  # lower-triangular L: L L^T = B
-            def Minv_smw(v, base=base, W=W, B_chol=B_chol, Nb=Nb, N=N):
-                y1 = base.matvec(v)
-                r  = y1[Nb + N :]
-                t  = np.linalg.solve(B_chol, r)
-                z  = np.linalg.solve(B_chol.T, t)
-                y2 = W @ z
-                return y1 - y2
-            M_u_op = spla.LinearOperator(
-                (n_alpha, n_alpha), matvec=Minv_smw, dtype=np.float64,
-            )
-        elif args.noise_mode == 'data-schur':
-            # Data-free base factor + exact rank-Nd Schur border.
-            #
-            # The cost of the bare 'data' preconditioner is the data
-            # δ-measurements co-located on the PDE Δδ-collocation points
-            # (X_data ⊂ X_dom): near-duplicate rows that the screened factor
-            # only resolves at large ρ. Instead, factor the *data-free*
-            # forward operator Θ_FF over {bdy, PDE} only — a clean,
-            # perfectly-screened system that inherits the forward solver's
-            # O(1) pCG behaviour — and bring the Nd data rows in as an exact
-            # bordered (Schur-complement) correction.
-            #
-            #   A = [[Θ_FF , Θ_Fd        ],   M_F ≈ Θ_FF⁻¹ (data-free factor)
-            #        [Θ_dF , Θ_dd + σ²I ]]    G   = Θ_Fd  (Nd cross-cov cols)
-            #   S = (Θ_dd + σ²I) − Gᵀ M_F G            (Nd×Nd Schur complement)
-            #   A⁻¹ via the standard 2×2 block-inverse using M_F and S⁻¹.
-            import scipy.linalg as _sla
-            nF = Nb + N
-            n_alpha = nF + Nd
-            sigma2 = float(sigma * sigma)
-            # Data-free forward factor: {δ_bdy, (−Δ + grad·∇)_pde}, NO data.
-            grad_F = np.stack([-op_u.w1, -op_u.w2], axis=1)
-            meas_F = [
-                _lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)), np.ones(Nb)),
-                _lgd(X_dom, -np.ones(N),  grad_F,            np.zeros(N)),
-            ]
-            impl_F = kl.ImplicitKLFactorization.build(
-                kernel_u, meas_F, rho=args.rho_small, k_neighbors=args.k_neighbors,
-            )
-            expl_F = kl.ExplicitKLFactorization(impl_F, nugget=args.nugget, backend='cpu')
-            M_F = SmallPrecond(expl_F.U, expl_F.P)
+        #   F = {bdy, PDE} forward block (screens, M_F + accurate CG);
+        #   d = {Nd noisy interior δ}.  Solve in closed form:
+        #     yF0 = Θ_FF⁻¹ rhs_F ;  x_d = S⁻¹(rhs_d − Θ_dF yF0)
+        #     x_F = Θ_FF⁻¹(rhs_F − Θ_Fd x_d)
+        #   with S = S0 + σ²I and S0 = Θ_dd − Θ_dF Θ_FF⁻¹ Θ_Fd the data-block
+        #   posterior covariance.  KEY: S0 is obtained WITHOUT any forward
+        #   solves via the block-inverse identity (Θ_joint⁻¹)_dd = S0⁻¹ — read
+        #   from the joint screened precision factor expl_su (built above from
+        #   meas_su=[bdy,pde,data]).  Cost = 2 forward solves + Nd sparse
+        #   matvecs + one tiny Nd×Nd dense solve.
+        import scipy.linalg as _sla
+        n_alpha = Nb + N + Nd
+        nF = Nb + N
+        sigma2 = float(sigma * sigma)
+        # data-free forward factor M_F + forward-only operator
+        meas_F = [_lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)), np.ones(Nb)),
+                  _lgd(X_dom, -np.ones(N), np.stack([-w1, -w2], 1), np.zeros(N))]
+        impl_F = kl.ImplicitKLFactorization.build(
+            kernel_u, meas_F, rho=args.rho_small, k_neighbors=args.k_neighbors)
+        expl_F = kl.ExplicitKLFactorization(impl_F, nugget=args.nugget, backend='cpu')
+        M_F = SmallPrecond(expl_F.U, expl_F.P)
+        MF_lin = M_F.as_linear_operator()
+        op_F = ThetaTrainOpU(expl_u, sf_u, Nb, N, 0, sigma, noise_mode='none')
+        op_F.set_weights(w1, w2)
+        opF_lin = op_F.as_linop()
+        op_nl = ThetaTrainOpU(expl_u, sf_u, Nb, N, Nd, sigma, noise_mode='none')
+        op_nl.set_weights(w1, w2)
+        if Nd > 0:
+            # S0⁻¹ = (Θ_joint⁻¹)_dd via the joint screened precision factor.
+            # NEAR-LINEAR extraction: SmallPrecond applies Θ⁻¹ = U Uᵀ in
+            # permuted coordinates (out[P] = U Uᵀ b[P]), so
+            #   (Θ⁻¹)[d_i, d_j] = (U Uᵀ)[a_i, a_j],  a = invP[d],
+            # i.e. the dd-block is the dense Gram of the Nd permuted-data ROWS
+            # of U. This is O(nnz in those rows), NOT Nd full Θ⁻¹-matvecs
+            # (which cost O(Nd·nnz(U)) = O(N²)).
+            d_rows = nF + np.arange(Nd)
+            P_su = np.asarray(expl_su.P, dtype=np.int64)
+            invP = np.empty(P_su.shape[0], dtype=np.int64)
+            invP[P_su] = np.arange(P_su.shape[0])
+            U_su = expl_su.U.tocsr()
+            Usub = U_su[invP[d_rows], :]
+            Pdd = np.asarray((Usub @ Usub.T).todense(), dtype=np.float64)
+            Pdd = 0.5 * (Pdd + Pdd.T)
+            S = np.linalg.inv(Pdd); S = 0.5 * (S + S.T) + sigma2 * np.eye(Nd)
+            Sc = _sla.cho_factor(S, lower=True)
+        def _solveFF(b):
+            nj = [0]
+            y, _ = spla.cg(opF_lin, b, x0=MF_lin @ b, M=MF_lin,
+                           rtol=1e-10, maxiter=200,
+                           callback=lambda _: nj.__setitem__(0, nj[0] + 1))
+            return y, nj[0]
+        def _Theta_dF(yF):
+            v = np.zeros(n_alpha); v[:nF] = yF; return op_nl.matvec(v)[nF:]
+        def _Theta_Fd(xd_):
+            v = np.zeros(n_alpha); v[nF:] = xd_; return op_nl.matvec(v)[:nF]
+        def bordered_solve(rhs, nF=nF):
+            yF0, k0 = _solveFF(rhs[:nF])
             if Nd == 0:
-                M_u_op = spla.LinearOperator(
-                    (n_alpha, n_alpha), matvec=M_F.matvec, dtype=np.float64)
-            else:
-                # Cross-covariance G = Θ_Fd and Θ_dd from the noiseless big-factor
-                # operator: column j is Θ_train · e_j for the j-th data row.
-                op_nl = ThetaTrainOpU(expl_u, sf_u, Nb, N, Nd, sigma, noise_mode='none')
-                op_nl.set_weights(op_u.w1, op_u.w2)
-                G = np.empty((nF, Nd)); Theta_dd = np.empty((Nd, Nd))
-                ej = np.zeros(n_alpha)
-                for j in range(Nd):
-                    ej[nF + j] = 1.0
-                    col = op_nl.matvec(ej)
-                    ej[nF + j] = 0.0
-                    G[:, j] = col[:nF]
-                    Theta_dd[:, j] = col[nF:]
-                MG = np.empty((nF, Nd))
-                for j in range(Nd):
-                    MG[:, j] = M_F.matvec(G[:, j])
-                S = Theta_dd + sigma2 * np.eye(Nd) - G.T @ MG
-                S = 0.5 * (S + S.T)
-                S_chol = _sla.cho_factor(S, lower=True)
-                def Minv_schur(v, M_F=M_F, G=G, S_chol=S_chol, nF=nF):
-                    vF = v[:nF]; vd = v[nF:]
-                    q  = M_F.matvec(vF)
-                    s  = _sla.cho_solve(S_chol, G.T @ q - vd)
-                    out = np.empty_like(v)
-                    out[:nF] = q + M_F.matvec(G @ s)
-                    out[nF:] = -s
-                    return out
-                M_u_op = spla.LinearOperator(
-                    (n_alpha, n_alpha), matvec=Minv_schur, dtype=np.float64)
-        elif args.noise_mode == 'data-bordered':
-            # NEAR-LINEAR data u-step: DIRECT bordered/Schur solve, no outer CG.
-            #   F = {bdy, PDE} forward block (screens, M_F + accurate CG);
-            #   d = {Nd noisy interior δ}.  Solve in closed form:
-            #     yF0 = Θ_FF⁻¹ rhs_F ;  x_d = S⁻¹(rhs_d − Θ_dF yF0)
-            #     x_F = Θ_FF⁻¹(rhs_F − Θ_Fd x_d)
-            #   with S = S0 + σ²I and S0 = Θ_dd − Θ_dF Θ_FF⁻¹ Θ_Fd the data-block
-            #   posterior covariance.  KEY: S0 is obtained WITHOUT any forward
-            #   solves via the block-inverse identity (Θ_joint⁻¹)_dd = S0⁻¹ — read
-            #   from the joint screened precision factor expl_su (built above from
-            #   meas_su=[bdy,pde,data]).  Cost = 2 forward solves + Nd sparse
-            #   matvecs + one tiny Nd×Nd dense solve.
-            import scipy.linalg as _sla
-            n_alpha = Nb + N + Nd
-            nF = Nb + N
-            sigma2 = float(sigma * sigma)
-            # data-free forward factor M_F + forward-only operator
-            meas_F = [_lgd(X_bdy, np.zeros(Nb), np.zeros((Nb, 2)), np.ones(Nb)),
-                      _lgd(X_dom, -np.ones(N), np.stack([-w1, -w2], 1), np.zeros(N))]
-            impl_F = kl.ImplicitKLFactorization.build(
-                kernel_u, meas_F, rho=args.rho_small, k_neighbors=args.k_neighbors)
-            expl_F = kl.ExplicitKLFactorization(impl_F, nugget=args.nugget, backend='cpu')
-            M_F = SmallPrecond(expl_F.U, expl_F.P)
-            MF_lin = M_F.as_linear_operator()
-            op_F = ThetaTrainOpU(expl_u, sf_u, Nb, N, 0, sigma, noise_mode='none')
-            op_F.set_weights(w1, w2)
-            opF_lin = op_F.as_linop()
-            op_nl = ThetaTrainOpU(expl_u, sf_u, Nb, N, Nd, sigma, noise_mode='none')
-            op_nl.set_weights(w1, w2)
-            if Nd > 0:
-                # S0⁻¹ = (Θ_joint⁻¹)_dd via the joint screened precision factor.
-                # NEAR-LINEAR extraction: SmallPrecond applies Θ⁻¹ = U Uᵀ in
-                # permuted coordinates (out[P] = U Uᵀ b[P]), so
-                #   (Θ⁻¹)[d_i, d_j] = (U Uᵀ)[a_i, a_j],  a = invP[d],
-                # i.e. the dd-block is the dense Gram of the Nd permuted-data ROWS
-                # of U. This is O(nnz in those rows), NOT Nd full Θ⁻¹-matvecs
-                # (which cost O(Nd·nnz(U)) = O(N²)).
-                d_rows = nF + np.arange(Nd)
-                P_su = np.asarray(expl_su.P, dtype=np.int64)
-                invP = np.empty(P_su.shape[0], dtype=np.int64)
-                invP[P_su] = np.arange(P_su.shape[0])
-                U_su = expl_su.U.tocsr()
-                Usub = U_su[invP[d_rows], :]
-                Pdd = np.asarray((Usub @ Usub.T).todense(), dtype=np.float64)
-                Pdd = 0.5 * (Pdd + Pdd.T)
-                S = np.linalg.inv(Pdd); S = 0.5 * (S + S.T) + sigma2 * np.eye(Nd)
-                Sc = _sla.cho_factor(S, lower=True)
-            def _solveFF(b):
-                nj = [0]
-                y, _ = spla.cg(opF_lin, b, x0=MF_lin @ b, M=MF_lin,
-                               rtol=1e-10, maxiter=200,
-                               callback=lambda _: nj.__setitem__(0, nj[0] + 1))
-                return y, nj[0]
-            def _Theta_dF(yF):
-                v = np.zeros(n_alpha); v[:nF] = yF; return op_nl.matvec(v)[nF:]
-            def _Theta_Fd(xd_):
-                v = np.zeros(n_alpha); v[nF:] = xd_; return op_nl.matvec(v)[:nF]
-            def bordered_solve(rhs, nF=nF):
-                yF0, k0 = _solveFF(rhs[:nF])
-                if Nd == 0:
-                    a = np.empty(n_alpha); a[:nF] = yF0; return a, 0, k0
-                xd = _sla.cho_solve(Sc, rhs[nF:] - _Theta_dF(yF0))
-                xF, k1 = _solveFF(rhs[:nF] - _Theta_Fd(xd))
-                a = np.empty(n_alpha); a[:nF] = xF; a[nF:] = xd
-                return a, 0, k0 + k1
-            M_u_op = None
-        elif args.noise_mode in ('uniform', 'schafer-2val'):
-            # Schäfer Algorithm 4.1 preconditioner for Σ = Θ_train + R.
-            #   * 'uniform':     R = σ²·I on ALL rows (homoscedastic; matched to
-            #     the 'uniform' operator). Validates that the trick gives O(1).
-            #   * 'schafer-2val': R = diag(ε² on the Nb+N bdy/PDE rows,
-            #     σ² on the Nd data rows) — the TRUE two-valued nugget. The
-            #     ichol of Θ⁻¹+R⁻¹ supports a per-row R⁻¹ vector directly, so
-            #     the screening pattern is untouched; the only question is
-            #     whether accuracy survives the ε²↔σ² spread.
-            # Correct symmetric preconditioner (this is the piece the old
-            # 'uniform' code was missing — it applied only Ũ⁻ᵀŨ⁻¹ = (Θ⁻¹+R⁻¹)⁻¹,
-            # which is NOT ≈(Θ+R)⁻¹):
-            #     M = R⁻¹ − R⁻¹ Ũ⁻ᵀ Ũ⁻¹ R⁻¹  ≈  (Θ + R)⁻¹.
-            n_alpha = Nb + N + Nd
-            if args.noise_mode == 'uniform':
-                R_vec = np.full(n_alpha, sigma * sigma, dtype=np.float64)
-            else:
-                R_vec = np.full(n_alpha, float(args.eps_pde), dtype=np.float64)
-                R_vec[Nb + N :] = sigma * sigma
-            noisy_su = kl.NoisyExplicitKLFactorization.build(expl_su, R=R_vec)
-            Ut_csr   = noisy_su.U_tilde.T.tocsr()
-            Utop_csr = noisy_su.U_tilde.tocsr()
-            P_su     = np.asarray(noisy_su.P, dtype=np.int64)
-            Rinv     = 1.0 / R_vec
-            def Minv_u(v, P_su=P_su, Ut=Ut_csr, Utop=Utop_csr, Rinv=Rinv):
-                t  = Rinv * v                       # R⁻¹ v
-                tp = t[P_su]
-                yy = spla.spsolve_triangular(Utop, tp, lower=False)   # Ũ⁻¹
-                zz = spla.spsolve_triangular(Ut,   yy, lower=True)    # Ũ⁻ᵀ
-                u  = np.empty_like(v); u[P_su] = zz                   # A⁻¹ R⁻¹ v
-                return t - Rinv * u                                   # R⁻¹v − R⁻¹A⁻¹R⁻¹v
-            M_u_op = spla.LinearOperator((n_alpha, n_alpha), matvec=Minv_u, dtype=np.float64)
-        else:
-            raise ValueError(f'unknown noise_mode {args.noise_mode!r}')
+                a = np.empty(n_alpha); a[:nF] = yF0; return a, 0, k0
+            xd = _sla.cho_solve(Sc, rhs[nF:] - _Theta_dF(yF0))
+            xF, k1 = _solveFF(rhs[:nF] - _Theta_Fd(xd))
+            a = np.empty(n_alpha); a[:nF] = xF; a[nF:] = xd
+            return a, 0, k0 + k1
 
         # rhs in α-layout [bdy, pde, data]:
         rhs_u = np.empty(Nb + N + Nd)
@@ -1270,16 +928,8 @@ def main(argv=None):
         rhs_u[Nb : Nb + N]       = rhs_f * np.exp(-w0)
         rhs_u[Nb + N :]          = data_noisy
         n_it_u = [0]
-        def _cb_u(_): n_it_u[0] += 1
         _tp = time.perf_counter()
-        if args.noise_mode == 'data-bordered':
-            alpha_u, info_u, n_it_u[0] = bordered_solve(rhs_u)
-        else:
-            x0u = M_u_op @ rhs_u
-            alpha_u, info_u = spla.cg(
-                op_u.as_linop(), rhs_u, x0=x0u, M=M_u_op,
-                rtol=args.pcg_rtol, maxiter=args.pcg_maxiter, callback=_cb_u,
-            )
+        alpha_u, info_u, n_it_u[0] = bordered_solve(rhs_u)
         _prof['u_pcg'] = time.perf_counter() - _tp
         # Recover (v0, v1, v2, v3) at X_dom from α_u via the big-factor forward apply.
         y_full_u = op_u.predict_at(alpha_u)

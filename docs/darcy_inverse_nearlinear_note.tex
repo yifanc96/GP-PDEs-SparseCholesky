@@ -221,7 +221,8 @@ The $u$-update is the posterior mean of $u\sim\cGP(0,K_u)$ under
 \underbrace{u(x_j^d)\approx y_j}_{N_d,\ \text{noise }\sigma}.
 \end{equation}
 In covariance (``$\alpha$-space'') form, with $\Thtr$ the Gram of these
-$N_\partial+N+N_d$ functionals and $R=\sigma^2$ on the data rows,
+$N_\partial+N+N_d$ functionals and the nugget $R=\sigma^2 I$ on the data
+rows (zero elsewhere),
 \begin{equation}\label{eq:alpha}
 (\Thtr + R)\,\alpha = \begin{pmatrix}g\\ b^\Omega\\ y\end{pmatrix},
 \qquad
@@ -602,7 +603,7 @@ $\tilde U\tilde U\T\approx\Th\inv+R\inv$. As a preconditioner it solves
 $\Sigma=\Th+\sigma^2 I$ in an $N$-robust $\sim\!20$--$46$ CG iterations at
 moderate $\sigma^2$ (verified, Sec.~\ref{sec:verif}). The object that genuinely
 resists factorization is the GN normal-equations Hessian
-$H=J_v\T\Th_u\inv J_v+J_w\T\Th_w\inv J_w+D$ \eqref{eq:H}: the Jacobian
+$H=2J_v\T\Th_u\inv J_v+2J_w\T\Th_w\inv J_w+D$ \eqref{eq:H}: the Jacobian
 sandwiching makes it a squared, biharmonic-like operator whose exact factor fills
 in ($\bigO(N^{2.8})$) and whose ill-conditioning ($\kappa(H)\sim10^{9}$) is
 \emph{not} of the screened form; an incomplete factorization of $H$ does not
@@ -640,10 +641,11 @@ sites are spatially distributed) would close the last gap and is the natural nex
 step. As implemented, the method already delivers near-linear total cost with
 $N$-robust two-mode recovery over $N=800$--$12800$.
 
-\paragraph{Reproduction.} \texttt{examples/darcy\_inverse\_hybrid.py} with
-\texttt{-{}-warmup-mode coarse} (default), \texttt{-{}-noise-mode data-bordered},
-\texttt{-{}-kernel-sigma-u 1.0 -{}-kernel-sigma-w 0.2 -{}-rho-small 3
--{}-warmup-steps 6 -{}-alt-steps 3}, sweeping \texttt{-{}-N-domain} /
-\texttt{-{}-N-data}.
+\paragraph{Reproduction.} Run \texttt{examples/darcy\_inverse\_hybrid.py}
+with no flags: the defaults are exactly the configuration of this note ---
+coarse warm-up, data-bordered $u$-step, split lengthscales
+$\ell_u=1.0$/$\ell_w=0.2$, $\rho=3$, $6$ warm-up steps, $3$ alternating
+steps. The scaling tables are produced by sweeping \texttt{-{}-N-domain}
+and \texttt{-{}-N-data}.
 
 \end{document}
