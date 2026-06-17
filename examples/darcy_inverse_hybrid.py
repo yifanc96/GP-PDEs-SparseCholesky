@@ -174,7 +174,7 @@ class _SparseFactorInv:
 
 
 # ===========================================================================
-# Stage 1 — joint-GN warm-up (compressed copy of darcy_inverse_pcg.py).
+# Stage 1 — joint-GN warm-up.
 # ===========================================================================
 
 
